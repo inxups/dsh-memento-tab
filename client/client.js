@@ -308,6 +308,20 @@
 
         const anchor = () => sessionHeader(ctx, sessionId)
 
+        // The host paints its transcript width handles — two absolutely
+        // positioned col-resize strips plus a glow line — whenever the session
+        // is active, whichever view tab is selected (ConversationRoot gates
+        // them on `phase === 'active'` alone, though the comment says
+        // "only while a transcript is on screen"). They size the transcript's
+        // content column, which this view does not have, so on this tab they
+        // draw a stray draggable line across the content. Hide them for exactly
+        // as long as this tab is mounted. `data-width-handle` is the stable hook
+        // the host stamps on each strip — the class name is a hashed CSS module,
+        // this attribute is not.
+        const widthHandleHider = document.createElement('style')
+        widthHandleHider.textContent = '[data-width-handle] { display: none !important; }'
+        document.head.appendChild(widthHandleHider)
+
         root.innerHTML = `
 <div class="mtt-bar">
   <input class="mtt-search" placeholder="${esc(t('search'))}" />
@@ -600,6 +614,7 @@
         return () => {
           if (searchTimer !== null) clearTimeout(searchTimer)
           abort.abort()
+          widthHandleHider.remove()
         }
       }
 
