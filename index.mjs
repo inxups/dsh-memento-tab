@@ -22,6 +22,18 @@
  * {@link TAB_HEADER} header; `/state` alone does not, so a stuck tab can still
  * be diagnosed from a plain `curl`.
  *
+ * ## Reading the tab is not recall
+ *
+ * `ctx.memory.query()` is the seam's only read method, and the provider builds
+ * it on a store read that increments `recall_count` for every row it returns —
+ * the store's primary sort key. A tab that reads on open, on every filter change
+ * and on every debounced keystroke would feed its own view traffic into the
+ * counter that ranks recall, reordering the list it is displaying for the
+ * agent's retrieval path too. So the entry page goes through
+ * {@link readEntries}: `store.listEntries()` plus a locally reproduced filter,
+ * falling back to the seam only when that accessor is absent. No read carries a
+ * `sessionId` either, so refreshes leave the `recalled` audit alone.
+ *
  * ## The approval gate: composed, not removed
  *
  * Writes carry no privileged path. Each one asks `approval/request` exactly the
@@ -471,12 +483,70 @@ function errorResponse(error) {
   return { status, payload }
 }
 
+/** Set once `readEntries` has had to fall back to the counting read path. */
+let recallBumpWarned = false
+
+/**
+ * Read one page of entries without touching the store's recall statistics.
+ *
+ * `ctx.memory.query()` is the typed seam, but the provider implements it over
+ * `store.queryEntries()`, which unconditionally increments `recall_count` and
+ * refreshes `last_recalled` on every row it returns. A tab that reads on open,
+ * on every filter change and on every debounced keystroke in the search box
+ * would push its own view traffic into that counter — and `recall_count` is the
+ * store's primary sort key, so merely looking at the tab would rewrite the order
+ * of the list it is showing, for the agent's retrieval path as well.
+ *
+ * So the management view reads `store.listEntries()` — the same accessor export
+ * uses, which never bumps — and applies the filter here, reproducing
+ * `queryEntries`' semantics: exact `track`/`scope`, case-insensitive substring
+ * on `text`, and `total` counted before the limit. Only when that accessor is
+ * missing does it fall back to `query()`, where bumping is the price of having a
+ * read path at all; that degradation is logged once rather than per request.
+ *
+ * Ordering is `created_at` descending (the accessor yields ascending, so the page
+ * is reversed): a management list wants the newest entry where the eye lands.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context (for the one-time warning).
+ * @param {Record<string, any>} memory - the ctx.memory service.
+ * @param {{limit: number, text?: string, track?: string, scope?: string}} filter - resolved filter.
+ * @returns {{entries: Array<Record<string, unknown>>, total: number, truncated: boolean}} one page.
+ */
+function readEntries(ctx, memory, filter) {
+  const list = entriesOf(memory)
+  if (list !== null) {
+    try {
+      const rows = list()
+      const needle = typeof filter.text === 'string' && filter.text.length > 0 ? filter.text.toLowerCase() : null
+      const matched = rows.filter((entry) => {
+        if (filter.track !== undefined && entry.track !== filter.track) return false
+        if (filter.scope !== undefined && entry.scope !== filter.scope) return false
+        if (needle !== null && !String(entry.text ?? '').toLowerCase().includes(needle)) return false
+        return true
+      })
+      return {
+        entries: matched.slice().reverse().slice(0, filter.limit),
+        total: matched.length,
+        truncated: matched.length > filter.limit,
+      }
+    } catch {
+      // Fall through to the seam: a throwing accessor is not a reason to lose the tab.
+    }
+  }
+  if (!recallBumpWarned) {
+    recallBumpWarned = true
+    serviceOf(ctx, 'logger')?.warn?.(
+      'dsh-memento-tab: store.listEntries() is unavailable, so /state reads through memory.query() and will increment recall_count',
+    )
+  }
+  return memory.query(filter)
+}
+
 /**
  * Serve the tab's whole read model in one round trip.
  *
- * Deliberately called without `sessionId`: this is a management view of the
- * store, and passing a session would make every refresh land a `recalled` audit
- * row and bump every entry's recall count.
+ * Deliberately called without `sessionId`: passing one would make every refresh
+ * land a `recalled` audit row. The entry page also avoids the typed seam so that
+ * reading the tab never increments `recall_count` — see {@link readEntries}.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  * @param {Record<string, any>} memory - the ctx.memory service.
  * @param {import('node:http').IncomingMessage} req - request carrying filters.
@@ -487,13 +557,13 @@ function handleState(ctx, memory, req, res) {
   const text = url.searchParams.get('text')
   const track = url.searchParams.get('track')
   const scope = url.searchParams.get('scope')
-  /** @type {Record<string, unknown>} */
+  /** @type {{limit: number, text?: string, track?: string, scope?: string}} */
   const filter = { limit: clampLimit(url.searchParams.get('limit'), DEFAULT_ENTRY_LIMIT, MAX_ENTRY_LIMIT) }
   if (text !== null && text.length > 0) filter.text = text
   if (track !== null && TRACKS.includes(track)) filter.track = track
   if (scope !== null && SCOPES.includes(scope)) filter.scope = scope
 
-  const result = memory.query(filter)
+  const result = readEntries(ctx, memory, filter)
   const ledger = ledgerOf(memory)
   const auditLimit = clampLimit(url.searchParams.get('auditLimit'), DEFAULT_AUDIT_LIMIT, MAX_AUDIT_LIMIT)
 

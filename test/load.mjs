@@ -68,7 +68,14 @@ function fakeMemory(options = {}) {
   if (options.noLedger !== true) store.listEntries = () => entries
   return {
     language: 'zh',
-    query: () => ({ entries: [entries[0]], total: entries.length, truncated: false }),
+    // Upstream's `query()` is implemented over a store read that increments every
+    // returned row's recall_count, so the tab is expected not to call it at all.
+    // Recording the calls is how the read path is held to that.
+    queryCalls: [],
+    query(filter) {
+      this.queryCalls.push(filter)
+      return { entries: [entries[0]], total: entries.length, truncated: false }
+    },
     budgets: () => [{ track: 'user', scope: 'workspace', used: 2, limit: 2000 }],
     // The seam's write path: tests replace `seed` when they need to inspect what
     // the route handed over, or to simulate a domain error (budget, gate).
@@ -288,6 +295,51 @@ await check('state route answers with the read model', async () => {
   assert.equal(body.exportAvailable, true)
   assert.equal(body.adaptersAvailable, false, 'no registry mounted is reported, never thrown')
   assert.equal(body.maxImportEntries, PLUGIN.MAX_IMPORT_ENTRIES)
+})
+
+console.log('read path: viewing the tab must not count as recall')
+
+await check('state reads the store directly instead of the counting seam', async () => {
+  const memory = fakeMemory({ entries: [
+    { id: 'e1', track: 'user', scope: 'workspace', text: 'alpha one', workspaceKey: '/w', agentKey: '' },
+    { id: 'e2', track: 'user', scope: 'workspace', text: 'beta two', workspaceKey: '/w', agentKey: '' },
+  ] })
+  const { routes } = await boot({ memory })
+  const body = (await hit(routes, '/api/memento-tab/state', fakeRequest('/api/memento-tab/state'))).json()
+  assert.equal(body.entries.length, 2, 'listEntries sees the whole store, not just query()\'s first row')
+  assert.equal(memory.queryCalls.length, 0, 'memory.query() increments recall_count on every row it returns')
+})
+
+await check('state filters track/scope/text the way the store does, newest first', async () => {
+  const memory = fakeMemory({ entries: [
+    { id: 'e1', track: 'user', scope: 'workspace', text: 'alpha one' },
+    { id: 'e2', track: 'agent', scope: 'workspace', text: 'ALPHA two' },
+    { id: 'e3', track: 'user', scope: 'user-global', text: 'beta' },
+  ] })
+  const { routes } = await boot({ memory })
+  const state = async (query) => (await hit(routes, '/api/memento-tab/state', fakeRequest(`/api/memento-tab/state${query}`))).json()
+
+  const byText = await state('?text=alpha')
+  assert.deepEqual(byText.entries.map((entry) => entry.id), ['e2', 'e1'], 'case-insensitive substring, newest first')
+  assert.equal(byText.total, 2)
+  assert.equal(byText.truncated, false)
+
+  const byLayer = await state('?track=user&scope=user-global')
+  assert.deepEqual(byLayer.entries.map((entry) => entry.id), ['e3'])
+
+  const capped = await state('?limit=1')
+  assert.equal(capped.entries.length, 1)
+  assert.equal(capped.total, 3, 'total counts matches before the limit')
+  assert.equal(capped.truncated, true)
+  assert.equal(memory.queryCalls.length, 0, 'every filtered read stays off the counting seam')
+})
+
+await check('state falls back to the seam when the store accessor is gone', async () => {
+  const memory = fakeMemory({ noLedger: true })
+  const { routes } = await boot({ memory })
+  const body = (await hit(routes, '/api/memento-tab/state', fakeRequest('/api/memento-tab/state'))).json()
+  assert.equal(body.entries.length, 1)
+  assert.equal(memory.queryCalls.length, 1, 'degraded, but the tab still renders')
 })
 
 await check('write route rejects a body with no sessionId', async () => {

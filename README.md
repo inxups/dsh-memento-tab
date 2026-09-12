@@ -28,8 +28,26 @@
 - **数据卡**：导出（memento 信封或任一适配器格式）+ 复制 / 下载；导入（选文件或粘贴）。
 - **适配器卡**：当前构建注册了哪些适配器、各自吃什么格式、导出成什么。
 - **审计尾**：`snapshot` / `recalled` / 每次写入，带时间戳与结果。
+- **看 tab 不计入召回**：读路径绕开 `ctx.memory.query()`，详情见下一节。
 
 样式全部走宿主自己的设计令牌（`--dsw-alias-*`），所以自动跟随亮/暗主题，不硬编码配色。
+
+## 读路径：看 tab 不算召回
+
+`ctx.memory.query()` 是接缝上唯一的读方法，但上游把它实现在 `store.queryEntries()` 之上，
+而后者会**给返回的每一行 `recall_count += 1` 并刷新 `last_recalled`**。`recall_count` 又是
+存储的排序主键。所以一个"打开时读、切筛选读、搜索框每敲一下也读"的界面，会把**自己的浏览
+流量灌进召回计数**——进而改掉它正在展示的那个列表的顺序，对模型的检索路径也一样。
+
+上游命令面有同样的副作用（`/memory list`、`query` 都会 bump，还会多写一行 `recalled` 审计），
+但那是人的一次显式动作；220ms 防抖的搜索框不是同一个量级。
+
+因此本插件走 `store.listEntries()`（和导出同一个访问器，永不 bump），在宿主侧复现
+`queryEntries` 的语义：`track` / `scope` 精确匹配、`text` 大小写不敏感子串、`total` 在截断前
+计数。排序取 `created_at` 降序——管理视图里最新的那条应该在眼睛落下的地方。
+
+`listEntries` 缺失的构建会退回 `query()`（有读路径总比没有强），并在日志里警告一次。
+`/state` 也**不传 `sessionId`**，所以刷新永远不会写 `recalled` 审计行。
 
 ## 数据：导出与导入
 
@@ -37,8 +55,8 @@
 
 - 不带 `adapterId` → `dsh-memento` 信封（`memory-export-v1`），**和 `/memory export` 出的文件
   是同一格式**，`/memory import` 直接吃得下；
-- 带 `adapterId` → 该适配器自己的产出（内置三个：`mem0-facts`、`hermes-memory-md`、
-  `claude-code-memory-md`）。
+- 带 `adapterId` → 该适配器自己的产出（内置三个：`mem0`、`hermes-memory-md`、
+  `claude-code-memory-md`；注意 `mem0` 适配器的 id 是 `mem0`，`mem0-facts` 是它的导出格式名）。
 
 拿到文本后可以一键复制或下载成文件（浏览器侧 `Blob`，不需要额外服务）。
 
@@ -115,7 +133,7 @@ dsh plugin --profile web add link:/path/to/dsh-memento-tab
 - **只读降级**：`auditList` / `proposalList` / `proposalDecide` / `listEntries` 在上游是
   provider 账本而非类型化接缝，`memoryAdapters` 也是独立服务，所以这里全部**特性探测**调用 ——
   上游改名只会让审计尾、提案区、适配器卡显示「此版本未暴露」，导出退化成「无法导出」，
-  不会让整个 tab 挂掉。
+  条目列表退回会 bump 召回计数的 `query()` 并警告一次，不会让整个 tab 挂掉。
 - **几处刻意耦合**：审批 `reason` 的格式（`writeReason()`）、导出信封的
   `plugin` / `schema`（`EXPORT_PLUGIN` / `EXPORT_SCHEMA`）、以及两个协议上限
   （`MAX_IMPORT_ENTRIES` / `MAX_MERGE_MATCHES`）都是从上游镜像来的常量。**冒烟测试会拿装好的
