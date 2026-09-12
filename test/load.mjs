@@ -84,17 +84,22 @@ function fakeWebServer(routes) {
  * Build an async-iterable request carrying an optional JSON body.
  * @param {string} url - request URL.
  * @param {unknown} [body] - JSON body to emit.
+ * @param {Record<string, string>} [headers] - request headers.
  * @returns {any} a request-shaped object.
  */
-function fakeRequest(url, body) {
+function fakeRequest(url, body, headers = {}) {
   const payload = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')]
   return {
     url,
+    headers,
     async *[Symbol.asyncIterator]() {
       for (const chunk of payload) yield chunk
     },
   }
 }
+
+/** Headers every write from the tab carries. */
+const TAB_HEADERS = { 'x-memento-tab': '1' }
 
 /** A response stub capturing status, headers and body. */
 function fakeResponse() {
@@ -190,7 +195,7 @@ await check('write route rejects a body with no sessionId', async () => {
   await ctx.plugin(PLUGIN)
   const res = fakeResponse()
   await routes.get('/api/memento-tab/write').handler(
-    fakeRequest('/api/memento-tab/write', { op: 'add', track: 'user', scope: 'workspace', text: 'x' }),
+    fakeRequest('/api/memento-tab/write', { op: 'add', track: 'user', scope: 'workspace', text: 'x' }, TAB_HEADERS),
     res,
   )
   assert.equal(res.statusCode, 400)
@@ -206,11 +211,99 @@ await check('write route rejects an unknown track before touching the seam', asy
   await ctx.plugin(PLUGIN)
   const res = fakeResponse()
   await routes.get('/api/memento-tab/write').handler(
-    fakeRequest('/api/memento-tab/write', { op: 'add', track: 'nope', scope: 'workspace', text: 'x', sessionId: 's1' }),
+    fakeRequest('/api/memento-tab/write', { op: 'add', track: 'nope', scope: 'workspace', text: 'x', sessionId: 's1' }, TAB_HEADERS),
     res,
   )
   assert.equal(res.statusCode, 400)
   assert.equal(res.json().code, 'INVALID_INPUT')
+})
+
+console.log('write authorisation')
+
+await check('write route refuses a request without the tab header', async () => {
+  const ctx = new Context()
+  ctx.provide('memory', fakeMemory())
+  ctx.provide('approval', fakeApproval())
+  const routes = new Map()
+  ctx.provide('webServer', fakeWebServer(routes))
+  await ctx.plugin(PLUGIN)
+  const res = fakeResponse()
+  await routes.get('/api/memento-tab/write').handler(
+    fakeRequest('/api/memento-tab/write', { op: 'add', track: 'user', scope: 'workspace', text: 'x', sessionId: 's1' }),
+    res,
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.json().code, 'MISSING_TAB_HEADER')
+})
+
+await check('decide route refuses a request without the tab header', async () => {
+  const ctx = new Context()
+  ctx.provide('memory', fakeMemory())
+  ctx.provide('approval', fakeApproval())
+  const routes = new Map()
+  ctx.provide('webServer', fakeWebServer(routes))
+  await ctx.plugin(PLUGIN)
+  const res = fakeResponse()
+  await routes.get('/api/memento-tab/decide').handler(
+    fakeRequest('/api/memento-tab/decide', { id: 'p1', decision: 'dismiss', sessionId: 's1' }),
+    res,
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.json().code, 'MISSING_TAB_HEADER')
+})
+
+console.log('approval composition')
+
+/**
+ * Compose this plugin's answerer with a stand-in for dsh-memento's prepended
+ * one, then run one request through the real waterfall.
+ * @param {{policy: 'ask'|'off'|'auto'}} upstream - what the stand-in decides.
+ * @param {Record<string, unknown>} request - approval request to send.
+ * @returns {Promise<string>} the winning outcome.
+ */
+async function runApproval(upstream, request) {
+  const ctx = new Context()
+  ctx.provide('memory', fakeMemory())
+  ctx.provide('approval', fakeApproval())
+  PLUGIN.installTabAnswerer(ctx)
+  // Upstream's answerer is PREPENDED and owns the hard decisions: `off` rejects
+  // without consulting anything downstream, `ask` delegates onward.
+  ctx.on('approval/request', async (req, next) => (upstream.policy === 'off' ? 'rejected' : next()), { prepend: true })
+  return ctx.waterfall('approval/request', request, async () => 'unavailable')
+}
+
+await check('a tab write is allowed when upstream would have asked', async () => {
+  const outcome = await runApproval({ policy: 'ask' }, {
+    toolName: 'memory',
+    reason: '[dsh-memento] add user/workspace\nx',
+    [PLUGIN.TAB_REQUEST_FIELD]: true,
+  })
+  assert.equal(outcome, 'allowed-once')
+})
+
+await check('writePolicy off still wins over the tab answerer', async () => {
+  const outcome = await runApproval({ policy: 'off' }, {
+    toolName: 'memory',
+    reason: '[dsh-memento] add user/workspace\nx',
+    [PLUGIN.TAB_REQUEST_FIELD]: true,
+  })
+  assert.equal(outcome, 'rejected')
+})
+
+await check('a write without the tab marker still stops at the human-facing step', async () => {
+  const outcome = await runApproval({ policy: 'ask' }, {
+    toolName: 'memory',
+    reason: '[dsh-memento] add user/workspace\nx',
+  })
+  assert.equal(outcome, 'unavailable', 'model-initiated writes must keep their approval')
+})
+
+await check('the tab marker predicate rejects foreign and malformed requests', () => {
+  assert.equal(PLUGIN.isTabWriteRequest(null), false)
+  assert.equal(PLUGIN.isTabWriteRequest('x'), false)
+  assert.equal(PLUGIN.isTabWriteRequest({ toolName: 'memory' }), false)
+  assert.equal(PLUGIN.isTabWriteRequest({ [PLUGIN.TAB_REQUEST_FIELD]: false }), false)
+  assert.equal(PLUGIN.isTabWriteRequest({ [PLUGIN.TAB_REQUEST_FIELD]: true }), true)
 })
 
 if (failures > 0) {

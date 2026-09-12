@@ -26,18 +26,37 @@
 
 样式全部走宿主自己的设计令牌（`--dsw-alias-*`），所以自动跟随亮/暗主题，不硬编码配色。
 
-## 写入：门是上游的，不是这里的
+## 写入：门是组合出来的，不是拆掉的
 
-这个插件**没有任何特权写入路径**。每一次写都会向 `approval/request` 提问，和上游
-`/memory` 命令完全一样，因此 `dsh-memento` 前置注册的 answerer 会先按
-`writePolicy` / `writePolicies` 裁决：
+这个插件**没有特权写入路径**。每一次写都会向 `approval/request` 提问，所以
+`dsh-memento` 前置注册的 answerer 永远**先**拿到请求，硬开关一律有效：
 
 | 配置 | 结果 |
 |---|---|
-| `writePolicy: ask` | 落到 DSH 内置审批 UI，人点确认 |
-| `writePolicy: auto` | 上游 answerer 放行，但仍然写 `approval/asked` + `approval/decided` 审计对 |
-| `writePolicy: off` | 拒绝，并且拒绝也进审计 |
-| 会话级 `never` | 在审批服务内部、任何 answerer 之前裁决 —— 本插件同样绕不过 |
+| `writePolicy: off` | 拒绝，并且拒绝也进审计。**tab 也绕不过** |
+| `writePolicies: {'track/scope': 'off'}` | 同上，在 tab 之前就裁决完 |
+| `writePolicy: auto` | 放行，仍然写 `approval/asked` + `approval/decided` 审计对 |
+| 会话级 `never` | 在进入瀑布之前就被拦下，本插件同样绕不过 |
+| `writePolicy: ask` | **tab 发起的写不再弹审批。** 见下 |
+
+`ask` 是唯一被改写的分支，改的是**最后那一步「问人」**：从 tab 点「保存」的是人，人就是审批人，
+再让他审批自己刚点的那一下是双重确认，不是安全属性。实现方式是自己注册一个**非 prepend** 的
+answerer，只认自己打上的 tab 标记：
+
+- 上游 answerer（prepend）先跑 → `off` / 细粒度策略在这里就已经 `rejected`，轮不到我
+- 落到「要问人」这一步 → 我的 answerer 对 tab 标记的请求回 `allowed-once`
+- 请求不带 tab 标记（模型调 `memory` 工具、`/memory` 命令）→ 原样落到人工审批 UI，**行为不变**
+- 瀑布兜底是 `unavailable`（fail closed），没人认领的请求一律拒绝
+
+标记不能放在 `reason` 里——上游按字节解析那个字符串——所以它走审批请求对象上的一个私有字段。
+
+### 一次点击换来的取舍
+
+`ask` 下 tab 的写变成免确认，意味着**本机上的任何进程**只要伪造那个请求头，也能不弹窗写入。
+路由和其它插件路由一样不做鉴权，我用一个自定义请求头（`x-memento-tab: 1`）挡住**网页**发起的
+跨站请求（跨域带自定义头需要 CORS 预检，这个服务不满足），但挡不住本机进程。
+
+想彻底关掉从 tab 写入：把 `writePolicy` 设成 `off`，或对该 `track/scope` 单独设 `off`。
 
 ## 安装
 
@@ -70,8 +89,10 @@ dsh plugin --profile web add link:/path/to/dsh-memento-tab
 - **一处刻意耦合**：审批 `reason` 必须以上游的请求标记 `[dsh-memento] ` 开头，因为那是上游
   answerer 认领请求的依据。格式在 `index.mjs` 的 `writeReason()` 里镜像了一份，并有冒烟测试
   断言。除此之外没有复制任何上游内部知识。
-- **不认证**：DSH 的 webserver 对自定义 `/api/*` 路由不做鉴权（上游面板路由同理）。
-  服务只监听回环地址；若把 `writePolicy` 设成 `auto`，同机进程即可写入，这是配置取舍。
+- **不认证，但有请求头闸门**：DSH 的 webserver 对自定义 `/api/*` 路由不做鉴权（上游面板路由
+  同理），服务只监听回环地址。本插件的写路由额外要求 `x-memento-tab: 1` 这个请求头，用来挡
+  跨站网页（跨域带自定义头要过 CORS 预检，本服务不满足）；挡不住本机进程。
+- **`apply()` 永不抛出**：见下一节。插件内部的任何异常都只打日志，不让 dsh 起不来。
 
 ## 启动安全（这是踩过坑的地方）
 

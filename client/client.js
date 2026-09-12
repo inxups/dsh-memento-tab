@@ -49,12 +49,12 @@
         scopeWorkspace: '工作区',
         onlyMine: '仅本会话',
         refresh: '刷新',
-        composePlaceholder: '记一条…（保存时会走审批门）',
+        composePlaceholder: '记一条…（直接写入，不再二次确认）',
         save: '保存',
         edit: '改写',
         remove: '删除',
         cancel: '取消',
-        confirmRemove: '删除这条记忆？会走审批门。',
+        confirmRemove: '删除这条记忆？此操作立即生效。',
         approving: '处理中…',
         approve: '批准',
         dismiss: '驳回',
@@ -97,12 +97,12 @@
         scopeWorkspace: 'Workspace',
         onlyMine: 'This session',
         refresh: 'Refresh',
-        composePlaceholder: 'Remember something… (saving goes through the approval gate)',
+        composePlaceholder: 'Remember something… (writes straight away, no second confirm)',
         save: 'Save',
         edit: 'Rewrite',
         remove: 'Delete',
         cancel: 'Cancel',
-        confirmRemove: 'Delete this entry? It will go through the approval gate.',
+        confirmRemove: 'Delete this entry? This takes effect immediately.',
         approving: 'Working…',
         approve: 'Approve',
         dismiss: 'Dismiss',
@@ -406,7 +406,7 @@
             const header = anchor()
             await api(ROUTE_WRITE, {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-memento-tab': '1' },
               body: JSON.stringify({ ...payload, sessionId, ...header }),
             }, abort.signal)
             if (abort.signal.aborted) return
@@ -429,7 +429,7 @@
             const header = anchor()
             await api(ROUTE_DECIDE, {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', 'x-memento-tab': '1' },
               body: JSON.stringify({ id, decision, sessionId, ...header }),
             }, abort.signal)
             if (abort.signal.aborted) return

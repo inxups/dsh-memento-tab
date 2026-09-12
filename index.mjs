@@ -8,19 +8,27 @@
  * break this plugin by changing its published seam — never by refactoring
  * internals.
  *
- * ## The approval gate is the seam's own
+ * ## The approval gate: composed, not removed
  *
  * Writes carry no privileged path. Each one asks `approval/request` exactly the
  * way the upstream `/memory` command does, so memento's prepended answerer
- * resolves `writePolicy` / `writePolicies` for the request before any
- * human-facing answerer sees it:
+ * resolves the policy for the request FIRST:
  *
- *   - `writePolicy: ask`  → the request falls through to the DSH approval UI.
- *   - `writePolicy: auto` → memento's answerer allows it and still writes the
- *                           `approval/asked` + `approval/decided` audit pair.
- *   - `writePolicy: off`  → rejected, and the rejection is audited.
- *   - a session-level `never` posture is decided inside the approval service,
- *     ahead of every answerer, so this plugin cannot bypass it either.
+ *   - `writePolicy: off`  → rejected, and the rejection is audited. A hard switch.
+ *   - `writePolicies` per `track/scope` → likewise decides before this plugin
+ *     ever sees the request.
+ *   - `writePolicy: auto` → allowed, with the `approval/asked` +
+ *     `approval/decided` audit pair.
+ *   - `writePolicy: ask`  → would fall through to the DSH approval UI. For a
+ *     write this tab initiated, {@link installTabAnswerer} answers instead:
+ *     the person who clicked Save IS the approver, so asking them to approve
+ *     their own click is a second confirmation, not a safety property. The
+ *     request never reaches the human-facing answerer.
+ *
+ * Model-initiated writes are untouched: they carry no tab marker and still stop
+ * at the approval UI. A session-level `never` posture is honoured before the
+ * waterfall is entered at all, because the approval service sits behind the
+ * fallback this plugin supplies and would otherwise never run.
  *
  * ## The one deliberate coupling
  *
@@ -28,7 +36,9 @@
  * string is how the upstream answerer claims a write. The format is mirrored in
  * {@link writeReason} and asserted by the repo's smoke test; it is the only
  * piece of upstream knowledge duplicated here, and it is a documented protocol
- * constant rather than an internal.
+ * constant rather than an internal. The tab's own marker cannot live in the
+ * reason (upstream parses it byte-for-byte), so it rides a separate field on the
+ * approval request object.
  *
  * @module dsh-memento-tab
  */
@@ -58,6 +68,21 @@ const REQUEST_MARKER = '[dsh-memento]'
 
 /** The approval tool name memento stamps on its write requests. */
 const APPROVAL_TOOL_NAME = 'memory'
+
+/**
+ * Field this plugin stamps on an approval request it raised from the tab UI.
+ *
+ * It cannot ride the `reason`: memento parses that string byte-for-byte. Unknown
+ * fields on the request object are ignored by upstream and by the approval
+ * service, so a private key is the safe carrier.
+ */
+export const TAB_REQUEST_FIELD = 'mementoTabInitiated'
+
+/** Header a write must carry, so a random web page cannot drive the route. */
+const TAB_HEADER = 'x-memento-tab'
+
+/** The only accepted value of {@link TAB_HEADER}. */
+const TAB_HEADER_VALUE = '1'
 
 const TRACKS = /** @type {const} */ (['user', 'agent'])
 const SCOPES = /** @type {const} */ (['user-global', 'workspace'])
@@ -203,7 +228,11 @@ function sessionAnchor(body) {
  * otherwise use the turn-scoped gate, which has no in-flight tool call to hang
  * an approval on outside a model turn. Asking `approval/request` directly keeps
  * memento's prepended answerer in the chain, so write policies still govern the
- * request.
+ * request — this gate only replaces the FALLBACK (the human-facing answerer),
+ * never the policy decision ahead of it.
+ *
+ * The supplied fallback is `unavailable`, i.e. fail closed, so a request nobody
+ * claims is denied rather than silently allowed.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
  * @param {{action: string, track: string, scope: string, text: string, count?: number, source?: string}} payload - write payload.
  * @param {{agent?: unknown}} write - write context carrying the session.
@@ -213,8 +242,8 @@ async function routeGate(ctx, payload, write) {
   const approval = ctx.approval
   const session = /** @type {{session?: unknown} | undefined} */ (write?.agent)?.session
   // Honour a session-level `never` posture before asking: the approval service
-  // decides it ahead of every answerer, so short-circuiting here matches the
-  // outcome memento's own command path produces.
+  // decides it ahead of every answerer, but it sits BEHIND the fallback below,
+  // so it would never run. Short-circuiting here reproduces its outcome.
   const override = typeof approval?.overrideOf === 'function' && session !== undefined
     ? approval.overrideOf(session)
     : undefined
@@ -224,7 +253,55 @@ async function routeGate(ctx, payload, write) {
     agent: write.agent,
     toolName: APPROVAL_TOOL_NAME,
     reason: writeReason(payload),
+    [TAB_REQUEST_FIELD]: true,
   }, async () => 'unavailable')
+}
+
+/**
+ * Whether one approval request was raised by this tab's own UI.
+ * @param {unknown} req - approval request shape.
+ * @returns {boolean} true when this plugin stamped its tab marker.
+ */
+export function isTabWriteRequest(req) {
+  return req !== null && typeof req === 'object'
+    && /** @type {Record<string, unknown>} */ (req)[TAB_REQUEST_FIELD] === true
+}
+
+/**
+ * Answer approvals raised by this tab with `allowed-once`.
+ *
+ * Registered WITHOUT `prepend`, so memento's prepended answerer runs first and
+ * keeps every hard decision: `writePolicy: off` and a `writePolicies` row for
+ * the request's `track/scope` both resolve to `rejected` before this handler is
+ * reached. What this handler replaces is only the last step — the human-facing
+ * question — for writes whose approver is the person who just clicked Save.
+ *
+ * Requests without the tab marker fall through untouched, so the model's
+ * `memory` tool and the `/memory` command keep their own approval behaviour.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ */
+export function installTabAnswerer(ctx) {
+  ctx.on('approval/request', async (/** @type {unknown} */ req, /** @type {() => Promise<string>} */ next) => {
+    if (!isTabWriteRequest(req)) return next()
+    return 'allowed-once'
+  })
+}
+
+/**
+ * Refuse a write whose request did not come from this plugin's own client.
+ *
+ * Every plugin route on the loopback server is unauthenticated, and a write here
+ * is auto-allowed — so a drive-by web page must not be able to reach it. A
+ * custom request header is the cheap defence: a cross-origin fetch cannot set
+ * one without a CORS preflight this server does not satisfy. It does NOT stop a
+ * local process that forges the header; nothing on this server does.
+ * @param {import('node:http').IncomingMessage} req - request to inspect.
+ * @throws {RouteError} when the header is absent.
+ */
+function requireTabHeader(req) {
+  if (req.headers?.[TAB_HEADER] !== TAB_HEADER_VALUE) {
+    throw new RouteError(403, `missing ${TAB_HEADER}: ${TAB_HEADER_VALUE}`, 'MISSING_TAB_HEADER')
+  }
 }
 
 /**
@@ -552,6 +629,7 @@ function registerRoutes(ctx, memory) {
       path: ROUTE_WRITE,
       handler: async (req, res) => {
         try {
+          requireTabHeader(req)
           const body = await readJsonBody(req)
           const anchor = sessionAnchor(body)
           const write = {
@@ -572,6 +650,7 @@ function registerRoutes(ctx, memory) {
       path: ROUTE_DECIDE,
       handler: async (req, res) => {
         try {
+          requireTabHeader(req)
           const body = await readJsonBody(req)
           const anchor = sessionAnchor(body)
           const write = {
@@ -601,6 +680,7 @@ function registerRoutes(ctx, memory) {
 export function apply(ctx) {
   try {
     const memory = /** @type {Record<string, any>} */ (ctx.memory)
+    installTabAnswerer(ctx)
     registerRoutes(ctx, memory)
   } catch (error) {
     const message = error instanceof Error ? error.stack ?? error.message : String(error)
