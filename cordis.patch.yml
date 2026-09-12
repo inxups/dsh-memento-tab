@@ -1,0 +1,11 @@
+# dsh-memento-tab bundle patch: inserts the host row into the profile's plugin
+# roster. The browser half rides this package's `dsh.client` manifest — the
+# client registry serves client/client.js under this package name — and this
+# row materializes the host half that owns the /api/memento-tab/* routes.
+#
+# `dsh plugin --profile <name> add <path-or-git-url>` applies this patch
+# automatically, so do NOT insert this row again in the profile patch
+# (duplicate loader ids crash the loader).
+- insert:
+    - id: dsh-memento-tab
+      name: 'dsh-memento-tab'

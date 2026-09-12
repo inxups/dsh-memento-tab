@@ -1,0 +1,60 @@
+{
+  "name": "dsh-memento-tab",
+  "version": "0.1.0",
+  "description": "Session-scoped memory tab for DeepSeek Harness, rendered beside Chat / Trajectory / Context. A companion to dsh-memento: it consumes the public ctx.memory seam and registers its own routes, so it never forks upstream.",
+  "license": "MIT",
+  "author": "inxups",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/inxups/dsh-memento-tab.git"
+  },
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": {
+      "default": "./index.mjs"
+    },
+    "./client": {
+      "default": "./client/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "client",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "memory",
+    "dsh-memento"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "dsh-memento": ">=0.5.0 <0.6.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}
