@@ -165,18 +165,20 @@
         const style = document.createElement('style')
         style.id = STYLE_ID
         style.textContent = `
-.mtt-root { height: 100%; overflow: auto; padding: 14px 18px 28px; box-sizing: border-box;
-  color: var(--dsw-alias-label-primary, #1b1b1b); font: 13px/1.55 system-ui, "Segoe UI", "PingFang SC", sans-serif; }
+.mtt-root { height: 100%; min-width: 0; box-sizing: border-box; overflow-x: hidden; overflow-y: auto;
+  padding: 14px 18px 28px; color: var(--dsw-alias-label-primary, #1b1b1b);
+  font-family: system-ui, "Segoe UI", "PingFang SC", sans-serif; font-size: 13px; line-height: 1.55; }
 .mtt-root * { box-sizing: border-box; }
 .mtt-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
-.mtt-search { flex: 1 1 220px; min-width: 160px; padding: 6px 10px; border-radius: 8px;
+.mtt-search { flex: 1 1 12rem; min-width: 0; height: 32px; padding: 0 10px; border-radius: 8px;
   border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.14));
   background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; font: inherit; }
 .mtt-search:focus { outline: none; border-color: var(--dsw-alias-brand-primary, #4d6bfe); }
-.mtt-select { padding: 6px 8px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.14));
+.mtt-select { min-width: 0; max-width: 100%; height: 32px; padding: 0 8px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.14));
   background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; font: inherit; }
 .mtt-check { display: inline-flex; align-items: center; gap: 5px; color: var(--dsw-alias-label-secondary, #5b5b5b); cursor: pointer; }
-.mtt-btn { padding: 6px 12px; border-radius: 8px; cursor: pointer; font: inherit;
+.mtt-btn { flex: none; height: 32px; padding: 0 12px; border-radius: 8px; cursor: pointer; font: inherit;
   border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.14));
   background: var(--dsw-alias-bg-layer-2, #f4f4f5); color: var(--dsw-alias-label-primary, #1b1b1b); }
 .mtt-btn:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(0,0,0,.05)); }
@@ -185,8 +187,12 @@
   color: var(--dsw-alias-label-primary-foreground, #fff); }
 .mtt-primary:hover { background: var(--dsw-alias-button-primary-hover, #3d5bee); }
 .mtt-danger { color: var(--dsw-alias-state-error-primary, #d33); }
-.mtt-compose { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 12px; }
-.mtt-compose textarea { flex: 1; padding: 6px 10px; border-radius: 8px; resize: vertical; font: inherit;
+/* Two lines, not one: a single flex row of two selects + a textarea cannot shrink
+   below its min-content width, so in a narrow conversation column it pushed the
+   textarea off-screen. The controls wrap on line 1; the textarea owns line 2. */
+.mtt-compose { display: grid; gap: 8px; margin-bottom: 12px; }
+.mtt-compose-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.mtt-compose textarea { width: 100%; min-width: 0; padding: 6px 10px; border-radius: 8px; resize: vertical; font: inherit;
   border: 1px solid var(--dsw-alias-border-l2, rgba(0,0,0,.14));
   background: var(--dsw-alias-bg-layer-1, #fff); color: inherit; }
 .mtt-msg { margin: 0 0 10px; padding: 7px 11px; border-radius: 8px; display: none; white-space: pre-wrap;
@@ -319,16 +325,18 @@
   <button class="mtt-btn mtt-refresh">${esc(t('refresh'))}</button>
 </div>
 <div class="mtt-compose">
-  <select class="mtt-select mtt-new-track">
-    <option value="user">${esc(t('trackUser'))}</option>
-    <option value="agent">${esc(t('trackAgent'))}</option>
-  </select>
-  <select class="mtt-select mtt-new-scope">
-    <option value="workspace">${esc(t('scopeWorkspace'))}</option>
-    <option value="user-global">${esc(t('scopeGlobal'))}</option>
-  </select>
+  <div class="mtt-compose-row">
+    <select class="mtt-select mtt-new-track">
+      <option value="user">${esc(t('trackUser'))}</option>
+      <option value="agent">${esc(t('trackAgent'))}</option>
+    </select>
+    <select class="mtt-select mtt-new-scope">
+      <option value="workspace">${esc(t('scopeWorkspace'))}</option>
+      <option value="user-global">${esc(t('scopeGlobal'))}</option>
+    </select>
+    <button class="mtt-btn mtt-primary mtt-save">${esc(t('save'))}</button>
+  </div>
   <textarea class="mtt-new-text" rows="2" placeholder="${esc(t('composePlaceholder'))}"></textarea>
-  <button class="mtt-btn mtt-primary mtt-save">${esc(t('save'))}</button>
 </div>
 <div class="mtt-msg"></div>
 <div class="mtt-body"></div>`

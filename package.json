@@ -1,6 +1,6 @@
 {
   "name": "dsh-memento-tab",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Session-scoped memory tab for DeepSeek Harness, rendered beside Chat / Trajectory / Context. A companion to dsh-memento: it consumes the public ctx.memory seam and registers its own routes, so it never forks upstream.",
   "license": "MIT",
   "author": "inxups",
