@@ -54,13 +54,83 @@ if (Context === null) {
   process.exit(0)
 }
 
-/** A memory seam stub shaped like the real one. */
-function fakeMemory() {
+/**
+ * A memory seam stub shaped like the real one.
+ * @param {{entries?: Array<Record<string, unknown>>, seed?: (inputs: any[]) => any, noLedger?: boolean}} [options] - knobs.
+ * @returns {any} a ctx.memory stand-in.
+ */
+function fakeMemory(options = {}) {
+  const entries = options.entries ?? [{ id: 'e1', track: 'user', scope: 'workspace', text: 'hi', workspaceKey: '/w', agentKey: '', tags: [] }]
+  const store = {
+    auditList: () => [{ ts: Date.now(), action: 'snapshot', outcome: 'ok' }],
+    proposalList: () => [],
+  }
+  if (options.noLedger !== true) store.listEntries = () => entries
   return {
     language: 'zh',
-    query: () => ({ entries: [{ id: 'e1', track: 'user', scope: 'workspace', text: 'hi', workspaceKey: '/w', agentKey: '', tags: [] }], total: 1, truncated: false }),
+    query: () => ({ entries: [entries[0]], total: entries.length, truncated: false }),
     budgets: () => [{ track: 'user', scope: 'workspace', used: 2, limit: 2000 }],
-    store: { auditList: () => [{ ts: Date.now(), action: 'snapshot', outcome: 'ok' }], proposalList: () => [] },
+    // The seam's write path: tests replace `seed` when they need to inspect what
+    // the route handed over, or to simulate a domain error (budget, gate).
+    seed: options.seed ?? (async (inputs) => ({ added: inputs.length, entries: inputs })),
+    store,
+  }
+}
+
+/**
+ * An adapter registry stub, shaped like dsh-memory-protocol's registry.
+ * @returns {any} a ctx.memoryAdapters stand-in.
+ */
+function fakeAdapters() {
+  /** @param {string} id - requested adapter id. */
+  const missing = (id) => {
+    const error = new Error(`no memory adapter registered with id ${JSON.stringify(id)}; check /memory adapters for the registered list`)
+    error.code = 'ADAPTER_NOT_FOUND'
+    error.details = { adapterId: id }
+    return error
+  }
+  return {
+    list: () => [
+      {
+        id: 'mem0-facts',
+        name: 'mem0 facts',
+        description: 'mem0 fact list adapter',
+        version: '1.0.0',
+        importFormats: ['mem0-facts'],
+        exportFormat: 'mem0-facts',
+      },
+      {
+        id: 'md-doc',
+        name: 'markdown document',
+        description: 'bullet markdown adapter',
+        version: '1.0.0',
+        importFormats: ['md-doc'],
+        exportFormat: 'md-doc',
+      },
+    ],
+    adapt: (id, payload) => {
+      // Deliberately takes a raw string only, so the route's JSON-parse-then-fall-
+      // back-to-text branch is exercised the way a markdown adapter exercises it.
+      if (id === 'md-doc') {
+        if (typeof payload !== 'string') {
+          const error = new Error('md-doc takes markdown text')
+          error.code = 'ADAPTER_PAYLOAD'
+          throw error
+        }
+        return {
+          entries: payload.split('\n').filter((line) => line.trim().length > 0)
+            .map((line) => ({ track: 'user', scope: 'workspace', text: line.replace(/^-\s*/, '') })),
+        }
+      }
+      if (id !== 'mem0-facts') throw missing(id)
+      const facts = Array.isArray(payload) ? payload : (payload?.facts ?? [])
+      return { entries: facts.map((fact) => ({ track: 'user', scope: 'user-global', text: String(fact.memory ?? fact) })) }
+    },
+    export: (id, entries) => {
+      if (id === 'md-doc') return { plugin: 'md-doc', text: entries.map((entry) => `- ${entry.text}`).join('\n') }
+      if (id !== 'mem0-facts') throw missing(id)
+      return { plugin: 'mem0', facts: entries.map((entry) => ({ memory: entry.text })) }
+    },
   }
 }
 
@@ -113,6 +183,35 @@ function fakeResponse() {
   }
 }
 
+/**
+ * Boot the plugin into a fresh context that has every service it reaches for.
+ * @param {{memory?: any, adapters?: any}} [options] - service overrides.
+ * @returns {Promise<{ctx: any, routes: Map<string, any>}>} context plus its routes.
+ */
+async function boot(options = {}) {
+  const ctx = new Context()
+  ctx.provide('memory', options.memory ?? fakeMemory())
+  ctx.provide('approval', fakeApproval())
+  if (options.adapters !== undefined) ctx.provide('memoryAdapters', options.adapters)
+  const routes = new Map()
+  ctx.provide('webServer', fakeWebServer(routes))
+  await ctx.plugin(PLUGIN)
+  return { ctx, routes }
+}
+
+/**
+ * Drive one registered route and collect its response.
+ * @param {Map<string, any>} routes - registered routes.
+ * @param {string} path - route path.
+ * @param {any} req - request to send.
+ * @returns {Promise<any>} the response stub.
+ */
+async function hit(routes, path, req) {
+  const res = fakeResponse()
+  await routes.get(path).handler(req, res)
+  return res
+}
+
 let failures = 0
 
 /**
@@ -132,7 +231,7 @@ async function check(label, body) {
 
 console.log('loader contract')
 
-await check('activates and registers all three routes when a web server exists', async () => {
+await check('activates and registers all five routes when a web server exists', async () => {
   const ctx = new Context()
   ctx.provide('memory', fakeMemory())
   ctx.provide('approval', fakeApproval())
@@ -141,6 +240,8 @@ await check('activates and registers all three routes when a web server exists',
   await ctx.plugin(PLUGIN)
   assert.deepEqual([...routes.keys()].sort(), [
     '/api/memento-tab/decide',
+    '/api/memento-tab/export',
+    '/api/memento-tab/import',
     '/api/memento-tab/state',
     '/api/memento-tab/write',
   ])
@@ -162,7 +263,7 @@ await check('picks the web server up when it appears after activation', async ()
   const routes = new Map()
   ctx.provide('webServer', fakeWebServer(routes))
   ctx.emit('internal/service', 'webServer')
-  assert.equal(routes.size, 3, 'routes should register once the service is announced')
+  assert.equal(routes.size, 5, 'routes should register once the service is announced')
 })
 
 console.log('route behaviour')
@@ -184,6 +285,9 @@ await check('state route answers with the read model', async () => {
   assert.equal(body.auditAvailable, true)
   assert.equal(body.proposalsAvailable, true)
   assert.equal(body.focus.workspaceKey, '/w')
+  assert.equal(body.exportAvailable, true)
+  assert.equal(body.adaptersAvailable, false, 'no registry mounted is reported, never thrown')
+  assert.equal(body.maxImportEntries, PLUGIN.MAX_IMPORT_ENTRIES)
 })
 
 await check('write route rejects a body with no sessionId', async () => {
@@ -248,6 +352,209 @@ await check('decide route refuses a request without the tab header', async () =>
     fakeRequest('/api/memento-tab/decide', { id: 'p1', decision: 'dismiss', sessionId: 's1' }),
     res,
   )
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.json().code, 'MISSING_TAB_HEADER')
+})
+
+console.log('data routes: export')
+
+/** A well-formed export envelope carrying the given entries. */
+function envelope(entries) {
+  return JSON.stringify({ plugin: 'dsh-memento', schema: PLUGIN.EXPORT_SCHEMA, exportedAt: new Date().toISOString(), entries })
+}
+
+await check('state reports the adapter registry when one is mounted', async () => {
+  const { routes } = await boot({ adapters: fakeAdapters() })
+  const body = (await hit(routes, '/api/memento-tab/state', fakeRequest('/api/memento-tab/state'))).json()
+  assert.equal(body.adaptersAvailable, true)
+  assert.equal(body.adapters.length, 2)
+  assert.equal(body.adapters[0].id, 'mem0-facts')
+})
+
+await check('export envelope carries the upstream schema and every entry', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/export', fakeRequest('/api/memento-tab/export', undefined, TAB_HEADERS))
+  const body = res.json()
+  assert.equal(res.statusCode, 200)
+  assert.equal(body.format, PLUGIN.EXPORT_SCHEMA)
+  assert.match(body.filename, /^dsh-memento-export-\d{4}-\d{2}-\d{2}-\d{4}\.json$/)
+  assert.equal(body.count, 1)
+  const parsed = JSON.parse(body.text)
+  assert.equal(parsed.plugin, PLUGIN.EXPORT_PLUGIN)
+  assert.equal(parsed.schema, PLUGIN.EXPORT_SCHEMA)
+  assert.equal(parsed.entries.length, 1)
+  assert.equal(parsed.entries[0].text, 'hi')
+})
+
+await check('export through an adapter returns that adapter format', async () => {
+  const { routes } = await boot({ adapters: fakeAdapters() })
+  const res = await hit(routes, '/api/memento-tab/export', fakeRequest('/api/memento-tab/export?adapterId=mem0-facts', undefined, TAB_HEADERS))
+  const body = res.json()
+  assert.equal(res.statusCode, 200)
+  assert.equal(body.adapterId, 'mem0-facts')
+  assert.equal(body.format, 'mem0-facts')
+  assert.match(body.filename, /-mem0-facts-\d{4}-\d{2}-\d{2}-\d{4}\.json$/)
+  assert.equal(JSON.parse(body.text).plugin, 'mem0')
+})
+
+await check('export of an unknown adapter is a 404 carrying its details', async () => {
+  const { routes } = await boot({ adapters: fakeAdapters() })
+  const res = await hit(routes, '/api/memento-tab/export', fakeRequest('/api/memento-tab/export?adapterId=nope', undefined, TAB_HEADERS))
+  assert.equal(res.statusCode, 404)
+  assert.equal(res.json().code, 'ADAPTER_NOT_FOUND')
+  assert.equal(res.json().adapterId, 'nope')
+})
+
+await check('export without an entry ledger is a 501, not a crash', async () => {
+  const { routes } = await boot({ memory: fakeMemory({ noLedger: true }) })
+  const res = await hit(routes, '/api/memento-tab/export', fakeRequest('/api/memento-tab/export', undefined, TAB_HEADERS))
+  assert.equal(res.statusCode, 501)
+  assert.equal(res.json().code, 'LEDGER_UNAVAILABLE')
+})
+
+await check('export refuses a request without the tab header', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/export', fakeRequest('/api/memento-tab/export'))
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.json().code, 'MISSING_TAB_HEADER')
+})
+
+console.log('data routes: import')
+
+/** Boot with a seam that records the exact batch the route handed to `seed`. */
+async function bootRecording(seed) {
+  const seen = []
+  const booted = await boot({
+    memory: fakeMemory({ seed: async (inputs) => { seen.push(...inputs); return seed(inputs) } }),
+  })
+  return { seen, routes: booted.routes }
+}
+
+await check('import of a memento envelope seeds every entry', async () => {
+  const { seen, routes } = await bootRecording(async (inputs) => ({ added: inputs.length }))
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: envelope([
+      { track: 'user', scope: 'workspace', text: 'a', workspaceKey: '/w1' },
+      { track: 'agent', scope: 'user-global', text: 'b', source: 'mem0' },
+    ]),
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.json().added, 2)
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].workspaceKey, '/w1', 'the file layer key is preserved by default')
+  assert.equal(seen[1].source, 'mem0')
+})
+
+await check('import with overrideKeys re-homes the batch to this session', async () => {
+  const { seen, routes } = await bootRecording(async (inputs) => ({ added: inputs.length }))
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: envelope([{ track: 'user', scope: 'workspace', text: 'a', workspaceKey: '/w1', agentKey: 'old' }]),
+    sessionId: 's1',
+    overrideKeys: true,
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 200)
+  assert.equal(seen[0].workspaceKey, undefined)
+  assert.equal(seen[0].agentKey, undefined)
+})
+
+await check('import rejects a foreign envelope', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: '{"plugin":"other","schema":"memory-export-v1","entries":[]}',
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().code, 'IMPORT_BAD_SCHEMA')
+})
+
+await check('import rejects an entry missing track/scope/text', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: envelope([{ track: 'user', scope: 'workspace' }]),
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().code, 'IMPORT_BAD_ENTRY')
+})
+
+await check('import refuses a batch over the upstream entry ceiling', async () => {
+  const rows = Array.from({ length: PLUGIN.MAX_IMPORT_ENTRIES + 1 }, (_, index) => ({ track: 'user', scope: 'workspace', text: `t${index}` }))
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', { payload: envelope(rows), sessionId: 's1' }, TAB_HEADERS))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().code, 'INVALID_INPUT')
+})
+
+await check('import through a JSON adapter converts the payload', async () => {
+  const seen = []
+  const { routes } = await boot({
+    adapters: fakeAdapters(),
+    memory: fakeMemory({ seed: async (inputs) => { seen.push(...inputs); return { added: inputs.length } } }),
+  })
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: JSON.stringify({ facts: [{ memory: 'from mem0' }] }),
+    adapterId: 'mem0-facts',
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.json().added, 1)
+  assert.equal(seen[0].text, 'from mem0')
+  assert.equal(seen[0].scope, 'user-global')
+})
+
+await check('import through a markdown adapter accepts raw text', async () => {
+  const seen = []
+  const { routes } = await boot({
+    adapters: fakeAdapters(),
+    memory: fakeMemory({ seed: async (inputs) => { seen.push(...inputs); return { added: inputs.length } } }),
+  })
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: '- one\n- two',
+    adapterId: 'md-doc',
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 200, 'a payload that is not JSON must reach the adapter as text')
+  assert.equal(res.json().added, 2)
+  assert.equal(seen[1].text, 'two')
+})
+
+await check('import of an unknown adapter is a 404', async () => {
+  const { routes } = await boot({ adapters: fakeAdapters() })
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: 'x',
+    adapterId: 'nope',
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  assert.equal(res.statusCode, 404)
+  assert.equal(res.json().code, 'ADAPTER_NOT_FOUND')
+})
+
+await check('import surfaces a budget rejection with its details', async () => {
+  const budget = new Error('memory budget exceeded: user/workspace at 1900/2000 chars, this write needs 300 chars; consolidate or remove entries, then retry')
+  budget.code = 'BUDGET_EXCEEDED'
+  budget.details = { track: 'user', scope: 'workspace', used: 1900, limit: 2000, needed: 300 }
+  const { routes } = await boot({ memory: fakeMemory({ seed: async () => { throw budget } }) })
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', {
+    payload: envelope([{ track: 'user', scope: 'workspace', text: 'x' }]),
+    sessionId: 's1',
+  }, TAB_HEADERS))
+  const body = res.json()
+  assert.equal(res.statusCode, 400)
+  assert.equal(body.code, 'BUDGET_EXCEEDED')
+  assert.equal(body.limit, 2000, 'the overage facts ride along so the tab can show them')
+})
+
+await check('import refuses a request with no sessionId before any write', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', { payload: envelope([{ track: 'user', scope: 'workspace', text: 'x' }]) }, TAB_HEADERS))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.json().code, 'NO_SESSION')
+})
+
+await check('import refuses a request without the tab header', async () => {
+  const { routes } = await boot()
+  const res = await hit(routes, '/api/memento-tab/import', fakeRequest('/api/memento-tab/import', { payload: envelope([{ track: 'user', scope: 'workspace', text: 'x' }]), sessionId: 's1' }))
   assert.equal(res.statusCode, 403)
   assert.equal(res.json().code, 'MISSING_TAB_HEADER')
 })

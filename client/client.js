@@ -34,6 +34,24 @@
       const ROUTE_STATE = '/api/memento-tab/state'
       const ROUTE_WRITE = '/api/memento-tab/write'
       const ROUTE_DECIDE = '/api/memento-tab/decide'
+      const ROUTE_EXPORT = '/api/memento-tab/export'
+      const ROUTE_IMPORT = '/api/memento-tab/import'
+
+      /**
+       * Headers every mutating (and egress) route requires. The custom header is
+       * the routes' only admission check: a cross-origin page cannot set one
+       * without a CORS preflight this server does not answer.
+       */
+      const TAB_HEADERS = { 'content-type': 'application/json', 'x-memento-tab': '1' }
+
+      /** GET-only variant of {@link TAB_HEADERS}. */
+      const TAB_HEADERS_GET = { 'x-memento-tab': '1' }
+
+      /** Mirrors the host route's body cap, so an oversized file never leaves the browser. */
+      const MAX_PAYLOAD_BYTES = 512 * 1024
+
+      /** Fallback for the merge ceiling when the host does not report one (older host). */
+      const MAX_MERGE_FALLBACK = 20
 
       const TRACKS = ['user', 'agent']
       const SCOPES = ['user-global', 'workspace']
@@ -75,6 +93,45 @@
         focusTag: '本会话',
         untitled: '（空）',
         noSession: '没有活动会话，记忆 tab 暂不可用。',
+        pick: '勾选以合并',
+        selected: '已选',
+        merge: '合并',
+        merged: '已合并',
+        clearSelection: '取消选择',
+        mergeIntro: '合并会删掉选中的条目，换成一整条新文本。同一层才能合并。',
+        mergeMixed: '选中的条目不在同一层（轨道/作用域不同），无法合并。',
+        mergeTooMany: '一次最多合并 20 条。',
+        mergePlaceholder: '合并后的新文本（上面是选中的原文，删减后提交）…',
+        mergeSubmit: '合并写入',
+        data: '数据',
+        entriesUnit: '条',
+        exportTitle: '导出',
+        exportMemento: 'memento JSON',
+        exportAdapterLabel: '格式',
+        exportRun: '导出',
+        exportEmpty: '库里还没有条目，导出会是空信封。',
+        copy: '复制',
+        copied: '已复制到剪贴板',
+        copyFailed: '复制失败，请手动选中下面的文本。',
+        download: '下载',
+        importTitle: '导入',
+        importAdapterLabel: '来源格式',
+        importPick: '选择文件…',
+        importPlaceholder: '在此粘贴 JSON 或 Markdown，或从上面选一个文件…',
+        importRun: '导入写入',
+        importOverride: '按当前会话重写层键',
+        importLimit: '单次最多',
+        importFile: '文件',
+        importConfirm: '确认导入并写入？',
+        importConfirmCount: '确认导入并写入？将写入',
+        importInvalid: '这不是一个 memento 导出文件（JSON 解析失败或结构不符）。',
+        importTooBig: '文件超过 512 KB，本插件的请求体上限就是它。',
+        importNothing: '还没有内容可导入。',
+        imported: '已导入',
+        adapters: '适配器',
+        noAdapters: '此构建没有注册任何适配器。',
+        adaptersUnavailable: '此构建未暴露适配器注册表。',
+        exportUnavailable: '此构建未暴露条目账本，无法导出。',
         code: {
           BUDGET_EXCEEDED: '这一层已写满。先整合或删几条再试——它不会替你截断。',
           AMBIGUOUS_MATCH: '子串命中了多条。换一个更长的唯一子串。',
@@ -82,8 +139,17 @@
           WRITE_DENIED: '写入被审批门拒绝。',
           WRITE_REQUIRES_AGENT: '写入需要会话上下文。',
           NO_SESSION: '缺少 sessionId。',
-          LEDGER_UNAVAILABLE: '此 dsh-memento 版本不提供提案账本。',
+          LEDGER_UNAVAILABLE: '此版本未暴露所需的账本。',
           PROPOSAL_NOT_FOUND: '该提案已被裁决或不存在。',
+          IMPORT_BAD_SCHEMA: '不是 dsh-memento 的 memory-export-v1 信封。',
+          IMPORT_BAD_ENTRY: '有条目缺少 track / scope / text。',
+          BAD_JSON: '内容不是合法 JSON。',
+          ADAPTER_NOT_FOUND: '没有这个适配器。',
+          ADAPTER_PAYLOAD: '内容不符合该适配器的格式。',
+          ADAPTERS_UNAVAILABLE: '此构建未挂载适配器注册表。',
+          MISSING_TAB_HEADER: '请求缺少来源标记，被路由拒绝。',
+          BODY_TOO_LARGE: '内容超过了请求体上限。',
+          INVALID_INPUT: '参数不合法。',
         },
       }
       const en = {
@@ -123,6 +189,45 @@
         focusTag: 'session',
         untitled: '(empty)',
         noSession: 'No active session; the memory tab is unavailable.',
+        pick: 'Select to merge',
+        selected: 'Selected',
+        merge: 'Merge',
+        merged: 'Merged',
+        clearSelection: 'Clear selection',
+        mergeIntro: 'Merging deletes the selected entries and replaces them with one new text. All of them must be in the same layer.',
+        mergeMixed: 'The selected entries are not all in the same layer (track/scope), so they cannot be merged.',
+        mergeTooMany: 'At most 20 entries can be merged at once.',
+        mergePlaceholder: 'The merged text (above is the selected originals — edit, then submit)…',
+        mergeSubmit: 'Merge and write',
+        data: 'Data',
+        entriesUnit: 'entries',
+        exportTitle: 'Export',
+        exportMemento: 'memento JSON',
+        exportAdapterLabel: 'Format',
+        exportRun: 'Export',
+        exportEmpty: 'The store is empty, so the export will be an empty envelope.',
+        copy: 'Copy',
+        copied: 'Copied to the clipboard',
+        copyFailed: 'Copy failed — select the text below by hand.',
+        download: 'Download',
+        importTitle: 'Import',
+        importAdapterLabel: 'Source format',
+        importPick: 'Choose a file…',
+        importPlaceholder: 'Paste JSON or Markdown here, or pick a file above…',
+        importRun: 'Import and write',
+        importOverride: 'Re-home to this session',
+        importLimit: 'Max per import',
+        importFile: 'File',
+        importConfirm: 'Import and write now?',
+        importConfirmCount: 'Import and write now? Entries:',
+        importInvalid: 'That is not a memento export (JSON parse failed, or the shape is wrong).',
+        importTooBig: 'The file exceeds 512 KB, which is this plugin\u2019s request-body cap.',
+        importNothing: 'Nothing to import yet.',
+        imported: 'Imported',
+        adapters: 'Adapters',
+        noAdapters: 'This build registered no adapters.',
+        adaptersUnavailable: 'This build exposes no adapter registry.',
+        exportUnavailable: 'This build exposes no entry ledger, so it cannot export.',
         code: {
           BUDGET_EXCEEDED: 'This layer is full. Consolidate or remove entries first — it never truncates for you.',
           AMBIGUOUS_MATCH: 'That substring matched more than one entry. Use a longer, unique one.',
@@ -130,8 +235,17 @@
           WRITE_DENIED: 'The approval gate refused the write.',
           WRITE_REQUIRES_AGENT: 'A write needs session context.',
           NO_SESSION: 'Missing sessionId.',
-          LEDGER_UNAVAILABLE: 'This dsh-memento build exposes no proposal ledger.',
+          LEDGER_UNAVAILABLE: 'This dsh-memento build exposes no ledger for that.',
           PROPOSAL_NOT_FOUND: 'That proposal was already decided, or does not exist.',
+          IMPORT_BAD_SCHEMA: 'Not a dsh-memento memory-export-v1 envelope.',
+          IMPORT_BAD_ENTRY: 'An entry is missing track / scope / text.',
+          BAD_JSON: 'That is not valid JSON.',
+          ADAPTER_NOT_FOUND: 'No such adapter.',
+          ADAPTER_PAYLOAD: 'The payload does not match that adapter\u2019s format.',
+          ADAPTERS_UNAVAILABLE: 'This composition mounted no adapter registry.',
+          MISSING_TAB_HEADER: 'The request carried no origin marker, so the route refused it.',
+          BODY_TOO_LARGE: 'The payload exceeded the request-body cap.',
+          INVALID_INPUT: 'Invalid argument.',
         },
       }
 
@@ -210,9 +324,14 @@
 .mtt-bar-fill { height: 100%; border-radius: 3px; background: var(--dsw-alias-brand-primary, #4d6bfe); }
 .mtt-bar-fill.warn { background: var(--dsw-alias-state-warn-primary, #e08b00); }
 .mtt-bar-fill.full { background: var(--dsw-alias-state-error-primary, #d33); }
-.mtt-entry { padding: 7px 9px; border-radius: 9px; margin-bottom: 5px;
+.mtt-entry { padding: 7px 9px; border-radius: 9px; margin-bottom: 5px; display: flex; gap: 8px;
   background: var(--dsw-alias-bg-layer-2, #f7f7f8); }
+.mtt-entry.picked { outline: 1px solid var(--dsw-alias-brand-primary, #4d6bfe); }
 .mtt-entry.focus { box-shadow: inset 2px 0 0 var(--dsw-alias-brand-primary, #4d6bfe); }
+/* The checkbox column is fixed and the text column absorbs the rest, so a long
+   entry can never push the row wider than the conversation column. */
+.mtt-entry > .pick { flex: none; margin: 2px 0 0; accent-color: var(--dsw-alias-brand-primary, #4d6bfe); }
+.mtt-entry-main { flex: 1 1 auto; min-width: 0; }
 .mtt-entry .t { white-space: pre-wrap; word-break: break-word; }
 .mtt-entry .m { margin-top: 4px; font-size: 11px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   color: var(--dsw-alias-label-tertiary, #8a8a8a); }
@@ -233,6 +352,26 @@
 .mtt-audit { display: flex; gap: 10px; padding: 3px 0; font-size: 12px;
   color: var(--dsw-alias-label-secondary, #5b5b5b); border-bottom: 1px dashed var(--dsw-alias-border-l2, rgba(0,0,0,.08)); }
 .mtt-audit .ts { color: var(--dsw-alias-label-tertiary, #8a8a8a); font-variant-numeric: tabular-nums; }
+/* Rows wrap rather than shrink: a select plus three buttons on one line is wider
+   than a narrow conversation column, and flex items never go below min-content. */
+.mtt-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.mtt-row > label { color: var(--dsw-alias-label-secondary, #5b5b5b); }
+.mtt-sub { display: grid; gap: 8px; margin-top: 10px; padding-top: 10px;
+  border-top: 1px dashed var(--dsw-alias-border-l2, rgba(0,0,0,.1)); }
+.mtt-sub > h5 { margin: 0; font-size: 12px; font-weight: 600;
+  color: var(--dsw-alias-label-secondary, #5b5b5b); }
+.mtt-file { min-width: 0; max-width: 100%; font: inherit; font-size: 12px; color: var(--dsw-alias-label-secondary, #5b5b5b); }
+.mtt-hint { margin: 0 0 8px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8a8a8a); }
+.mtt-sel { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; padding: 8px 10px;
+  border-radius: 10px; border: 1px solid var(--dsw-alias-brand-primary, #4d6bfe);
+  background: var(--dsw-alias-bg-layer-2, #f4f4f5); }
+.mtt-sel > strong { font-weight: 600; }
+.mtt-sel .mtt-hint { margin: 0; flex: 1 1 12rem; }
+.mtt-adapter { padding: 7px 9px; border-radius: 9px; margin-bottom: 6px;
+  background: var(--dsw-alias-bg-layer-2, #f7f7f8); }
+.mtt-adapter .id { font-weight: 600; }
+.mtt-adapter .d { margin-top: 3px; color: var(--dsw-alias-label-secondary, #5b5b5b); }
+.mtt-adapter .f { margin-top: 3px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #8a8a8a); }
 .mtt-empty { margin: 8px 0; color: var(--dsw-alias-label-tertiary, #8a8a8a); }
 `
         document.head.appendChild(style)
@@ -251,6 +390,7 @@
         if (!response.ok || payload.ok === false) {
           const error = new Error(payload.error ?? `HTTP ${response.status}`)
           error.code = payload.code
+          error.status = response.status
           throw error
         }
         return payload
@@ -304,6 +444,22 @@
           data: /** @type {any} */ (null),
           error: /** @type {string} */ (''),
           notice: /** @type {string} */ (''),
+          // Multi-select for `consolidate`. Kept as entry ids and matched against
+          // the live list on every render, so a refresh that drops an entry
+          // cannot leave a phantom in the merge.
+          selected: /** @type {string[]} */ ([]),
+          merging: false,
+          mergeDraft: '',
+          // Data card. `exportText` is the last fetched payload, held in state so
+          // a re-render (which rebuilds the card's DOM) cannot lose it.
+          exportAdapterId: '',
+          exportText: '',
+          exportName: '',
+          importAdapterId: '',
+          importText: '',
+          importName: '',
+          overrideKeys: false,
+          busy: false,
         }
 
         const anchor = () => sessionHeader(ctx, sessionId)
@@ -396,9 +552,9 @@
           render()
         }
 
-        /** Run one write and reload on success. */
+        /** Run one write and reload on success. Returns whether it landed. */
         async function write(payload, okMessage) {
-          if (state.saving) return
+          if (state.saving) return false
           state.saving = true
           saveBtn.disabled = true
           say(t('approving'), false)
@@ -406,19 +562,21 @@
             const header = anchor()
             await api(ROUTE_WRITE, {
               method: 'POST',
-              headers: { 'content-type': 'application/json', 'x-memento-tab': '1' },
+              headers: TAB_HEADERS,
               body: JSON.stringify({ ...payload, sessionId, ...header }),
             }, abort.signal)
-            if (abort.signal.aborted) return
+            if (abort.signal.aborted) return false
             state.saving = false
             saveBtn.disabled = false
             await refresh()
             say(okMessage, false)
+            return true
           } catch (error) {
-            if (abort.signal.aborted) return
+            if (abort.signal.aborted) return false
             state.saving = false
             saveBtn.disabled = false
             say(describeError(t, error), true)
+            return false
           }
         }
 
@@ -429,7 +587,7 @@
             const header = anchor()
             await api(ROUTE_DECIDE, {
               method: 'POST',
-              headers: { 'content-type': 'application/json', 'x-memento-tab': '1' },
+              headers: TAB_HEADERS,
               body: JSON.stringify({ id, decision, sessionId, ...header }),
             }, abort.signal)
             if (abort.signal.aborted) return
@@ -437,6 +595,169 @@
             say(decision === 'approve' ? t('approved') : t('dismissed'), false)
           } catch (error) {
             if (abort.signal.aborted) return
+            say(describeError(t, error), true)
+          }
+        }
+
+        /** The live entries behind the current selection, in list order. */
+        function selectedEntries() {
+          const entries = Array.isArray(state.data?.entries) ? state.data.entries : []
+          return entries.filter((entry) => state.selected.includes(entry.id))
+        }
+
+        /**
+         * The merge ceiling, read live from the host's read model so the tab
+         * cannot drift from the seam's own limit.
+         * @returns {number} maximum matches in one `consolidate`.
+         */
+        function maxMerge() {
+          const reported = state.data?.maxMergeMatches
+          return typeof reported === 'number' && reported > 0 ? reported : MAX_MERGE_FALLBACK
+        }
+
+        /**
+         * Whether the selection can be merged, and why not when it cannot.
+         * @returns {{ok: boolean, reason: string, track: string, scope: string}} verdict.
+         */
+        function mergeVerdict() {
+          const picked = selectedEntries()
+          const track = picked.length > 0 ? picked[0].track : ''
+          const scope = picked.length > 0 ? picked[0].scope : ''
+          if (picked.length < 2) return { ok: false, reason: '', track, scope }
+          if (picked.length > maxMerge()) return { ok: false, reason: `${t('mergeTooMany')} (${maxMerge()})`, track, scope }
+          const mixed = picked.some((entry) => entry.track !== track || entry.scope !== scope)
+          if (mixed) return { ok: false, reason: t('mergeMixed'), track, scope }
+          return { ok: true, reason: '', track, scope }
+        }
+
+        /** Fetch the export payload for the selected format. */
+        async function runExport() {
+          if (state.busy) return
+          state.busy = true
+          say(t('approving'), false)
+          try {
+            const query = state.exportAdapterId.length > 0
+              ? `?adapterId=${encodeURIComponent(state.exportAdapterId)}`
+              : ''
+            const payload = await api(`${ROUTE_EXPORT}${query}`, { headers: TAB_HEADERS_GET }, abort.signal)
+            if (abort.signal.aborted) return
+            state.busy = false
+            state.exportText = typeof payload.text === 'string' ? payload.text : ''
+            state.exportName = typeof payload.filename === 'string' ? payload.filename : 'dsh-memento-export.txt'
+            render()
+            say(`${t('exportRun')} · ${payload.count ?? 0} ${t('entriesUnit')}`, false)
+          } catch (error) {
+            if (abort.signal.aborted) return
+            state.busy = false
+            say(describeError(t, error), true)
+          }
+        }
+
+        /** Hand the last export to the browser as a file download. */
+        function downloadExport() {
+          if (state.exportText.length === 0) return
+          const blob = new Blob([state.exportText], { type: 'application/json;charset=utf-8' })
+          const href = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = href
+          link.download = state.exportName
+          document.body.appendChild(link)
+          link.click()
+          link.remove()
+          // Revoke on the next tick: the click has already been dispatched.
+          setTimeout(() => URL.revokeObjectURL(href), 0)
+        }
+
+        /** Copy the last export, falling back to a manual selection. */
+        async function copyExport() {
+          if (state.exportText.length === 0) return
+          try {
+            await navigator.clipboard.writeText(state.exportText)
+            say(t('copied'), false)
+          } catch {
+            const field = root.querySelector('.mtt-export-text')
+            if (field !== null) {
+              field.focus()
+              field.select()
+            }
+            say(t('copyFailed'), true)
+          }
+        }
+
+        /** Read one chosen file into the import buffer. */
+        async function pickFile(file) {
+          if (file.size > MAX_PAYLOAD_BYTES) {
+            say(t('importTooBig'), true)
+            return
+          }
+          try {
+            state.importText = await file.text()
+            state.importName = file.name
+            render()
+            say(`${t('importFile')} · ${file.name}`, false)
+          } catch (error) {
+            say(describeError(t, error), true)
+          }
+        }
+
+        /**
+         * The confirmation shown before a batch write.
+         *
+         * For a memento envelope the entry count and target layers are known
+         * locally; for an adapter payload only the host can decode it, so the
+         * dialog says what will happen without inventing a count.
+         */
+        function describeImport() {
+          if (state.importAdapterId.length > 0) {
+            return `${t('importConfirmCount')} ${state.importAdapterId} (${t('importAdapterLabel')})?`
+          }
+          try {
+            const parsed = JSON.parse(state.importText)
+            const rows = Array.isArray(parsed?.entries) ? parsed.entries : null
+            if (rows === null) return t('importConfirm')
+            const layers = [...new Set(rows.map((row) => `${row?.track ?? '?'}/${row?.scope ?? '?'}`))]
+            return `${t('importConfirmCount')} ${rows.length} ${t('entriesUnit')} → ${layers.join(', ')}`
+          } catch {
+            return t('importConfirm')
+          }
+        }
+
+        /** Seed one batch through the same gate a single write uses. */
+        async function runImport() {
+          if (state.busy || state.saving) return
+          if (state.importText.trim().length === 0) {
+            say(t('importNothing'), true)
+            return
+          }
+          if (!window.confirm(describeImport())) return
+          state.busy = true
+          saveBtn.disabled = true
+          say(t('approving'), false)
+          try {
+            const header = anchor()
+            const payload = await api(ROUTE_IMPORT, {
+              method: 'POST',
+              headers: TAB_HEADERS,
+              body: JSON.stringify({
+                payload: state.importText,
+                ...(state.importAdapterId.length > 0 ? { adapterId: state.importAdapterId } : {}),
+                overrideKeys: state.overrideKeys,
+                sessionId,
+                ...header,
+              }),
+            }, abort.signal)
+            if (abort.signal.aborted) return
+            state.busy = false
+            saveBtn.disabled = false
+            state.importText = ''
+            state.importName = ''
+            await refresh()
+            render()
+            say(`${t('imported')} ${payload.added ?? 0} ${t('entriesUnit')}`, false)
+          } catch (error) {
+            if (abort.signal.aborted) return
+            state.busy = false
+            saveBtn.disabled = false
             say(describeError(t, error), true)
           }
         }
@@ -460,13 +781,113 @@
                  <button class="mtt-btn" data-cancel="${esc(entry.id)}">${esc(t('cancel'))}</button>
                </div>`
             : ''
-          return `<div class="mtt-entry${isFocus && entry.scope === 'workspace' ? ' focus' : ''}" data-idx="${index}">
-  <div class="t">${esc(entry.text) || esc(t('untitled'))}</div>
-  <div class="m">${meta.join('')}
-    <button data-edit="${esc(entry.id)}">${esc(t('edit'))}</button>
-    <button class="mtt-danger" data-remove="${esc(entry.id)}">${esc(t('remove'))}</button>
+          const picked = state.selected.includes(entry.id)
+          return `<div class="mtt-entry${isFocus && entry.scope === 'workspace' ? ' focus' : ''}${picked ? ' picked' : ''}" data-idx="${index}">
+  <input type="checkbox" class="pick" data-pick="${esc(entry.id)}"${picked ? ' checked' : ''} title="${esc(t('pick'))}" aria-label="${esc(t('pick'))}" />
+  <div class="mtt-entry-main">
+    <div class="t">${esc(entry.text) || esc(t('untitled'))}</div>
+    <div class="m">${meta.join('')}
+      <button data-edit="${esc(entry.id)}">${esc(t('edit'))}</button>
+      <button class="mtt-danger" data-remove="${esc(entry.id)}">${esc(t('remove'))}</button>
+    </div>
+    ${draft}
   </div>
-  ${draft}
+</div>`
+        }
+
+        /** The multi-select action bar, shown while anything is picked. */
+        function selectionHtml() {
+          const picked = selectedEntries()
+          if (picked.length === 0 && !state.merging) return ''
+          const verdict = mergeVerdict()
+          const bar = `<div class="mtt-sel">
+  <strong>${esc(t('selected'))} ${picked.length} ${esc(t('entriesUnit'))}</strong>
+  <button class="mtt-btn mtt-primary mtt-merge"${verdict.ok ? '' : ' disabled'}>${esc(t('merge'))}</button>
+  <button class="mtt-btn mtt-clear">${esc(t('clearSelection'))}</button>
+  ${verdict.reason.length > 0
+    ? `<span class="mtt-hint">${esc(verdict.reason)}</span>`
+    : `<span class="mtt-hint">${esc(t('mergeIntro'))}</span>`}
+</div>`
+
+          if (!state.merging) return bar
+          const originals = picked.map((entry) => entry.text).join('\n')
+          return `${bar}<div class="mtt-card">
+  <h4>${esc(t('merge'))} · ${esc(groupTitle(t, verdict.track, verdict.scope))}</h4>
+  <div class="mtt-empty">${esc(originals)}</div>
+  <textarea class="mtt-edit mtt-merge-text" rows="4" placeholder="${esc(t('mergePlaceholder'))}">${esc(state.mergeDraft)}</textarea>
+  <div class="mtt-edit-row">
+    <button class="mtt-btn mtt-primary mtt-merge-go"${verdict.ok ? '' : ' disabled'}>${esc(t('mergeSubmit'))}</button>
+    <button class="mtt-btn mtt-merge-cancel">${esc(t('cancel'))}</button>
+  </div>
+</div>`
+        }
+
+        /** One `<select>` of registered adapters, with a leading "raw" option. */
+        function adapterOptionsHtml(selected, rawLabel) {
+          const adapters = Array.isArray(state.data?.adapters) ? state.data.adapters : []
+          const raw = `<option value=""${selected === '' ? ' selected' : ''}>${esc(rawLabel)}</option>`
+          return raw + adapters.map((adapter) => `<option value="${esc(adapter.id)}"${selected === adapter.id ? ' selected' : ''}>${esc(adapter.id)}</option>`).join('')
+        }
+
+        /** The data card: export on the left of the divider, import under it. */
+        function dataHtml() {
+          const data = state.data
+          const total = typeof data.total === 'number' ? data.total : 0
+          const limit = typeof data.maxImportEntries === 'number' ? data.maxImportEntries : ''
+          const canExport = data.exportAvailable === true
+          const hasExport = state.exportText.length > 0
+
+          const exportRow = canExport
+            ? `<div class="mtt-row">
+    <label>${esc(t('exportAdapterLabel'))}</label>
+    <select class="mtt-select mtt-export-adapter">${adapterOptionsHtml(state.exportAdapterId, t('exportMemento'))}</select>
+    <button class="mtt-btn mtt-export-run">${esc(t('exportRun'))}</button>
+    <button class="mtt-btn mtt-copy"${hasExport ? '' : ' disabled'}>${esc(t('copy'))}</button>
+    <button class="mtt-btn mtt-download"${hasExport ? '' : ' disabled'}>${esc(t('download'))}</button>
+  </div>
+  ${hasExport
+    ? `<textarea class="mtt-edit mtt-export-text" rows="3" readonly>${esc(state.exportText)}</textarea>
+       <p class="mtt-hint">${esc(state.exportName)}</p>`
+    : `<p class="mtt-hint">${esc(total === 0 ? t('exportEmpty') : t('exportRun'))}</p>`}`
+            : `<p class="mtt-hint">${esc(t('exportUnavailable'))}</p>`
+
+          return `<div class="mtt-card">
+  <h4>${esc(t('data'))}<span>${total} ${esc(t('entriesUnit'))}</span></h4>
+  <div class="mtt-sub"><h5>${esc(t('exportTitle'))}</h5>${exportRow}</div>
+  <div class="mtt-sub">
+    <h5>${esc(t('importTitle'))}${limit === '' ? '' : ` · ${esc(t('importLimit'))} ${esc(limit)}`}</h5>
+    <div class="mtt-row">
+      <label>${esc(t('importAdapterLabel'))}</label>
+      <select class="mtt-select mtt-import-adapter">${adapterOptionsHtml(state.importAdapterId, t('exportMemento'))}</select>
+      <input type="file" class="mtt-file" accept=".json,.md,.txt,application/json,text/markdown,text/plain" />
+    </div>
+    <textarea class="mtt-edit mtt-import-text" rows="3" placeholder="${esc(t('importPlaceholder'))}">${esc(state.importText)}</textarea>
+    <div class="mtt-row">
+      <label class="mtt-check"><input type="checkbox" class="mtt-override"${state.overrideKeys ? ' checked' : ''} />${esc(t('importOverride'))}</label>
+      <button class="mtt-btn mtt-primary mtt-import-run">${esc(t('importRun'))}</button>
+      ${state.importName.length > 0 ? `<span class="mtt-hint">${esc(state.importName)}</span>` : ''}
+    </div>
+  </div>
+</div>`
+        }
+
+        /** The adapter registry: what can be imported from and exported to. */
+        function adaptersHtml() {
+          const data = state.data
+          if (data.adaptersAvailable !== true) {
+            return `<div class="mtt-card"><h4>${esc(t('adapters'))}</h4><div class="mtt-empty">${esc(t('adaptersUnavailable'))}</div></div>`
+          }
+          const adapters = Array.isArray(data.adapters) ? data.adapters : []
+          if (adapters.length === 0) {
+            return `<div class="mtt-card"><h4>${esc(t('adapters'))}</h4><div class="mtt-empty">${esc(t('noAdapters'))}</div></div>`
+          }
+          return `<div class="mtt-card">
+  <h4>${esc(t('adapters'))}<span>${adapters.length}</span></h4>
+  ${adapters.map((adapter) => `<div class="mtt-adapter">
+    <div><span class="id">${esc(adapter.id)}</span> · ${esc(adapter.name)} v${esc(adapter.version)}</div>
+    <div class="d">${esc(adapter.description)}</div>
+    <div class="f">import: ${esc((adapter.importFormats ?? []).join(', '))} · export: ${esc(adapter.exportFormat ?? '')}</div>
+  </div>`).join('')}
 </div>`
         }
 
@@ -527,6 +948,11 @@
             cards.push(`<div class="mtt-card"><h4>${esc(t('proposals'))}</h4><div class="mtt-empty">${esc(t('auditUnavailable'))}</div></div>`)
           }
 
+          // Data and adapters sit above the audit tail: the audit is a log and
+          // can run to dozens of rows, so nothing actionable belongs below it.
+          cards.push(dataHtml())
+          cards.push(adaptersHtml())
+
           const audit = Array.isArray(data.audit) ? data.audit : []
           cards.push(`<div class="mtt-card">
   <h4>${esc(t('audit'))}<span>${audit.length}</span></h4>
@@ -539,7 +965,7 @@
   </div>`).join('')}
 </div>`)
 
-          body.innerHTML = cards.join('')
+          body.innerHTML = selectionHtml() + cards.join('')
         }
 
         // ── wiring ──────────────────────────────────────────────────────────
@@ -558,7 +984,7 @@
           const text = newText.value.trim()
           if (text.length === 0) return
           void write({ op: 'add', track: newTrack.value, scope: newScope.value, text }, t('saved'))
-            .then(() => { newText.value = '' })
+            .then((ok) => { if (ok === true) newText.value = '' })
         })
 
         body.addEventListener('click', (event) => {
@@ -606,7 +1032,102 @@
           const approveId = button.getAttribute('data-approve')
           if (approveId !== null) { void decide(approveId, 'approve'); return }
           const dismissId = button.getAttribute('data-dismiss')
-          if (dismissId !== null) { void decide(dismissId, 'dismiss') }
+          if (dismissId !== null) { void decide(dismissId, 'dismiss'); return }
+
+          // ── multi-select merge ────────────────────────────────────────────
+          if (button.classList.contains('mtt-clear')) {
+            state.selected = []
+            state.merging = false
+            state.mergeDraft = ''
+            render()
+            return
+          }
+          if (button.classList.contains('mtt-merge-cancel')) {
+            state.merging = false
+            render()
+            return
+          }
+          if (button.classList.contains('mtt-merge')) {
+            // Seed the editor with the originals joined by newlines: the merge
+            // still needs a human-authored text, this is only a starting point.
+            state.merging = true
+            state.mergeDraft = selectedEntries().map((entry) => entry.text).join('\n')
+            render()
+            return
+          }
+          if (button.classList.contains('mtt-merge-go')) {
+            const verdict = mergeVerdict()
+            const picked = selectedEntries()
+            const text = state.mergeDraft.trim()
+            if (!verdict.ok || text.length === 0) return
+            void write({
+              op: 'consolidate',
+              track: verdict.track,
+              scope: verdict.scope,
+              matches: picked.map((entry) => entry.text),
+              text,
+            }, t('merged')).then((ok) => {
+              if (ok) {
+                state.selected = []
+                state.merging = false
+                state.mergeDraft = ''
+                render()
+              }
+            })
+            return
+          }
+
+          // ── data card ─────────────────────────────────────────────────────
+          if (button.classList.contains('mtt-export-run')) { void runExport(); return }
+          if (button.classList.contains('mtt-copy')) { void copyExport(); return }
+          if (button.classList.contains('mtt-download')) { downloadExport(); return }
+          if (button.classList.contains('mtt-import-run')) { void runImport() }
+        })
+
+        // Selections and the sticky data-card inputs live inside the re-rendered
+        // body, so their values are mirrored into `state` on the way in and
+        // re-emitted by `render()` — a refresh can then never lose a paste.
+        body.addEventListener('change', (event) => {
+          const target = /** @type {HTMLElement} */ (event.target)
+          if (target.classList.contains('pick')) {
+            const id = target.getAttribute('data-pick')
+            if (id === null) return
+            const element = /** @type {HTMLInputElement} */ (target)
+            state.selected = element.checked
+              ? [...state.selected, id]
+              : state.selected.filter((candidate) => candidate !== id)
+            render()
+            return
+          }
+          if (target.classList.contains('mtt-export-adapter')) {
+            state.exportAdapterId = /** @type {HTMLSelectElement} */ (target).value
+            return
+          }
+          if (target.classList.contains('mtt-import-adapter')) {
+            state.importAdapterId = /** @type {HTMLSelectElement} */ (target).value
+            return
+          }
+          if (target.classList.contains('mtt-override')) {
+            state.overrideKeys = /** @type {HTMLInputElement} */ (target).checked
+            return
+          }
+          if (target.classList.contains('mtt-file')) {
+            const file = /** @type {HTMLInputElement} */ (target).files?.[0]
+            if (file !== undefined) void pickFile(file)
+          }
+        })
+
+        body.addEventListener('input', (event) => {
+          const target = /** @type {HTMLElement} */ (event.target)
+          // Deliberately no render() here: rebuilding the body on every keystroke
+          // would drop the caret out of the field being typed into.
+          if (target.classList.contains('mtt-merge-text')) {
+            state.mergeDraft = /** @type {HTMLTextAreaElement} */ (target).value
+            return
+          }
+          if (target.classList.contains('mtt-import-text')) {
+            state.importText = /** @type {HTMLTextAreaElement} */ (target).value
+          }
         })
 
         void refresh()

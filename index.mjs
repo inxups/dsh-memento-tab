@@ -2,11 +2,25 @@
  * dsh-memento-tab — host half.
  *
  * A companion to `dsh-memento`, deliberately *not* a fork of it. This half owns
- * three JSON routes on the composition's `webServer` and delegates every read
+ * five JSON routes on the composition's `webServer` and delegates every read
  * and every write to the public `ctx.memory` seam. Nothing here imports a
  * private module from the upstream package, so an upstream release can only
  * break this plugin by changing its published seam — never by refactoring
  * internals.
+ *
+ * ## Routes
+ *
+ *   - `GET  /state`  — the whole read model in one round trip (entries, budgets,
+ *     audit tail, pending proposals, adapter list).
+ *   - `POST /write`  — `add | replace | remove | consolidate` through the seam.
+ *   - `POST /decide` — approve or dismiss one pending proposal.
+ *   - `GET  /export` — the memento envelope, or one adapter's own format.
+ *   - `POST /import` — seed a batch from a memento envelope or an adapter
+ *     payload, through the same gate and the same budget pre-check as any write.
+ *
+ * The three mutating routes (and export, which is mass egress) require the
+ * {@link TAB_HEADER} header; `/state` alone does not, so a stuck tab can still
+ * be diagnosed from a plain `curl`.
  *
  * ## The approval gate: composed, not removed
  *
@@ -30,15 +44,21 @@
  * waterfall is entered at all, because the approval service sits behind the
  * fallback this plugin supplies and would otherwise never run.
  *
- * ## The one deliberate coupling
+ * ## The deliberate couplings
  *
- * An approval `reason` must start with memento's request marker, because that
- * string is how the upstream answerer claims a write. The format is mirrored in
- * {@link writeReason} and asserted by the repo's smoke test; it is the only
- * piece of upstream knowledge duplicated here, and it is a documented protocol
- * constant rather than an internal. The tab's own marker cannot live in the
- * reason (upstream parses it byte-for-byte), so it rides a separate field on the
- * approval request object.
+ * Everything upstream-specific here is a documented constant rather than an
+ * internal, and each one is pinned by the repo's smoke test:
+ *
+ *   - An approval `reason` must start with memento's request marker, because
+ *     that string is how the upstream answerer claims a write. The format is
+ *     mirrored in {@link writeReason}. The tab's own marker cannot live in the
+ *     reason (upstream parses it byte-for-byte), so it rides a separate field on
+ *     the approval request object.
+ *   - {@link EXPORT_SCHEMA}, {@link EXPORT_PLUGIN} and {@link MAX_IMPORT_ENTRIES}
+ *     define the interchange format `/memory export` and `/memory import` use.
+ *   - `auditList` / `proposalList` / `proposalDecide` / `listEntries` live on the
+ *     provider handle rather than on the typed seam, so they are called through
+ *     feature-detected accessors that degrade to "unavailable".
  *
  * @module dsh-memento-tab
  */
@@ -90,6 +110,31 @@ const SCOPES = /** @type {const} */ (['user-global', 'workspace'])
 const ROUTE_STATE = '/api/memento-tab/state'
 const ROUTE_WRITE = '/api/memento-tab/write'
 const ROUTE_DECIDE = '/api/memento-tab/decide'
+const ROUTE_EXPORT = '/api/memento-tab/export'
+const ROUTE_IMPORT = '/api/memento-tab/import'
+
+/**
+ * Export envelope `schema` value, mirrored from dsh-memento's `EXPORT_SCHEMA`.
+ *
+ * Duplicated rather than imported: this package deliberately depends on no
+ * subpath of the upstream package, so a file written by `/memory export` can
+ * only be recognised by copying the constant. The smoke test pins it against
+ * the installed upstream, the same way {@link writeReason} is pinned.
+ */
+export const EXPORT_SCHEMA = 'memory-export-v1'
+
+/** Export envelope `plugin` value, mirrored from the upstream export path. */
+export const EXPORT_PLUGIN = 'dsh-memento'
+
+/** Batch ceiling, mirrored from dsh-memento's `MAX_IMPORT_ENTRIES` (pinned by smoke test). */
+export const MAX_IMPORT_ENTRIES = 1000
+
+/**
+ * Substring ceiling for one merge, mirrored from dsh-memento's
+ * `MAX_CONSOLIDATE_MATCHES` (pinned by smoke test). The seam enforces it too;
+ * the tab uses it to disable the button before a doomed round trip.
+ */
+export const MAX_MERGE_MATCHES = 20
 
 /** Request bodies are tiny JSON documents; cap them rather than trusting a peer. */
 const MAX_BODY_BYTES = 512 * 1024
@@ -323,6 +368,40 @@ function ledgerOf(memory) {
 }
 
 /**
+ * Read the provider's whole entry list through one feature-detected accessor.
+ *
+ * Export needs every entry regardless of the resolved workspace/agent key, which
+ * the typed seam does not offer — `ctx.memory.query()` is filtered and would
+ * bump recall counters. Like {@link ledgerOf}, this is defensive: a renamed
+ * accessor degrades export to "unavailable" rather than failing the tab.
+ * @param {unknown} memory - the ctx.memory service.
+ * @returns {(() => Array<Record<string, unknown>>) | null} bound listEntries when usable.
+ */
+function entriesOf(memory) {
+  const store = /** @type {{store?: unknown}} */ (memory)?.store
+  if (store === null || typeof store !== 'object') return null
+  const list = /** @type {{listEntries?: unknown}} */ (store).listEntries
+  if (typeof list !== 'function') return null
+  return () => /** @type {Array<Record<string, unknown>>} */ (list.call(store))
+}
+
+/**
+ * Read the dsh-memory-protocol adapter registry, if this composition mounted one.
+ *
+ * `memoryAdapters` is provided by dsh-memento itself, so it is reached through
+ * `ctx.get` (never `ctx.<name>`, which throws for a service that is not in
+ * {@link inject}) and every capability is checked before use.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @returns {{list: Function, adapt: Function, export: Function} | null} usable registry.
+ */
+function adapterRegistryOf(ctx) {
+  const registry = serviceOf(ctx, 'memoryAdapters')
+  if (registry === null || registry === undefined) return null
+  if (typeof registry.list !== 'function' || typeof registry.adapt !== 'function' || typeof registry.export !== 'function') return null
+  return registry
+}
+
+/**
  * Split one `track` value, rejecting anything outside the vocabulary.
  * @param {unknown} value - raw value.
  * @param {readonly string[]} allowed - permitted values.
@@ -355,9 +434,9 @@ function clampLimit(raw, fallback, max) {
  * Project one thrown error into the response body the client branches on.
  *
  * dsh-memento's domain errors carry a stable `.code` (`BUDGET_EXCEEDED`,
- * `AMBIGUOUS_MATCH`, `ENTRY_NOT_FOUND`, `WRITE_DENIED`, …); those surface
- * verbatim so the tab can offer "consolidate and retry" instead of a wall of
- * text.
+ * `AMBIGUOUS_MATCH`, `ENTRY_NOT_FOUND`, `WRITE_DENIED`, …) plus a JSON-safe
+ * `.details`; both surface verbatim so the tab can offer "consolidate and retry"
+ * with the exact overage instead of a wall of text.
  * @param {unknown} error - thrown value.
  * @returns {{status: number, payload: Record<string, unknown>}} status plus body.
  */
@@ -374,10 +453,21 @@ function errorResponse(error) {
   const message = error instanceof Error ? error.message : String(error)
   /** @type {Record<string, unknown>} */
   const payload = { ok: false, code, error: message }
+  // dsh-memento puts the machine-readable facts in `details` (budget usage,
+  // ambiguous-match candidates, the adapter id). They are JSON-safe by contract
+  // and the client can act on them, so pass them through.
+  const details = /** @type {{details?: unknown}} */ (error)?.details
+  if (details !== null && typeof details === 'object' && !Array.isArray(details)) {
+    Object.assign(payload, details)
+  }
   const candidates = /** @type {{candidates?: unknown}} */ (error)?.candidates
   if (Array.isArray(candidates)) payload.candidates = candidates
   // A refused write is a normal outcome of the gate, not a server fault.
-  const status = code === 'WRITE_DENIED' || code === 'WRITE_REQUIRES_AGENT' ? 403 : 400
+  const status = code === 'WRITE_DENIED' || code === 'WRITE_REQUIRES_AGENT'
+    ? 403
+    : code === 'ADAPTER_NOT_FOUND'
+      ? 404
+      : 400
   return { status, payload }
 }
 
@@ -429,6 +519,18 @@ function handleState(ctx, memory, req, res) {
     }
   }
 
+  let adapters = []
+  let adaptersAvailable = false
+  const registry = adapterRegistryOf(ctx)
+  if (registry !== null) {
+    try {
+      adapters = registry.list()
+      adaptersAvailable = true
+    } catch {
+      adaptersAvailable = false
+    }
+  }
+
   sendJson(res, 200, {
     ok: true,
     entries: result.entries,
@@ -444,6 +546,11 @@ function handleState(ctx, memory, req, res) {
     auditAvailable,
     proposals,
     proposalsAvailable,
+    adapters,
+    adaptersAvailable,
+    exportAvailable: entriesOf(memory) !== null,
+    maxImportEntries: MAX_IMPORT_ENTRIES,
+    maxMergeMatches: MAX_MERGE_MATCHES,
   })
 }
 
@@ -546,6 +653,238 @@ async function runDecide(ctx, memory, body, write) {
   }
   void ctx
   return { ok: true, decision: 'approved', id, entry: result.entry, usage: result.usage }
+}
+
+/** Compact local timestamp for a download filename (`2026-09-12-1830`). */
+function stampOf(/** @type {Date} */ now = new Date()) {
+  const pad = (/** @type {number} */ value) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+}
+
+/**
+ * Decode one adapter payload the way the upstream file path does.
+ *
+ * `/memory import --adapter=<id> <path>` reads the file and tries JSON, falling
+ * back to the raw text because the markdown adapters take prose. The tab always
+ * receives a string, so it reproduces that branch exactly.
+ * @param {string} payload - raw payload text.
+ * @returns {unknown} parsed JSON when it parses, else the original string.
+ */
+function parseOrText(payload) {
+  try {
+    return JSON.parse(payload)
+  } catch {
+    return payload
+  }
+}
+
+/**
+ * Project one entry into the export payload, mirroring `/memory export`.
+ *
+ * Ids, timestamps and recall counters ride along for fidelity; the import path
+ * ignores them and re-mints, exactly as upstream does.
+ * @param {Record<string, unknown>} entry - store entry.
+ * @returns {Record<string, unknown>} JSON-safe projection.
+ */
+function publicEntry(entry) {
+  /** @type {Record<string, unknown>} */
+  const out = {}
+  for (const key of ['id', 'track', 'scope', 'workspaceKey', 'agentKey', 'text', 'source', 'tags', 'version', 'createdAt', 'updatedAt', 'lastRecalled', 'recallCount']) {
+    if (entry[key] !== undefined) out[key] = entry[key]
+  }
+  // The one field upstream's own export omits but its validator requires:
+  // `validateMemoryEntry` demands `sessionId` be null or a string, so a document
+  // without the key is rejected by `validateExportEnvelope`. Carrying it costs
+  // nothing (import ignores it) and makes the file acceptable to any third-party
+  // importer that validates instead of hand-rolling a shape check.
+  out.sessionId = entry.sessionId ?? null
+  return out
+}
+
+/**
+ * Build the memento export document.
+ *
+ * Exported as a pure function so the smoke test can assert the exact document
+ * against dsh-memento's own `validateExportEnvelope` — which is the only way to
+ * be sure the file this tab writes is one `/memory import` will accept.
+ * @param {Array<Record<string, unknown>>} entries - store entries.
+ * @param {Array<Record<string, unknown>>} budgets - `memory.budgets()` output.
+ * @returns {Record<string, unknown>} the envelope.
+ */
+export function exportEnvelope(entries, budgets) {
+  return {
+    plugin: EXPORT_PLUGIN,
+    schema: EXPORT_SCHEMA,
+    exportedAt: new Date().toISOString(),
+    budgets,
+    entries: entries.map(publicEntry),
+  }
+}
+
+/**
+ * Resolve one adapter's export format label, for the download extension.
+ * @param {{list: Function}} registry - adapter registry.
+ * @param {string} adapterId - adapter id.
+ * @returns {string} the adapter's `exportFormat`, or '' when unknown.
+ */
+function exportFormatOf(registry, adapterId) {
+  try {
+    const row = registry.list().find((/** @type {{id?: string}} */ adapter) => adapter.id === adapterId)
+    return typeof /** @type {{exportFormat?: unknown}} */ (row)?.exportFormat === 'string'
+      ? String(/** @type {{exportFormat?: string}} */ (row).exportFormat)
+      : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Build one export payload: the memento envelope, or one adapter's own format.
+ * @param {Record<string, any>} memory - the ctx.memory service.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {Record<string, unknown>} body - parsed request body.
+ * @returns {Record<string, unknown>} `{ok, text, filename, format, adapterId, count}`.
+ * @throws {RouteError} when the entry ledger or the adapter registry is missing.
+ */
+function runExport(memory, ctx, body) {
+  const list = entriesOf(memory)
+  if (list === null) {
+    throw new RouteError(501, 'this dsh-memento build exposes no entry ledger', 'LEDGER_UNAVAILABLE')
+  }
+  const entries = list()
+  const adapterId = body.adapterId
+
+  if (adapterId === undefined || adapterId === null || adapterId === '') {
+    return {
+      ok: true,
+      adapterId: null,
+      format: EXPORT_SCHEMA,
+      filename: `dsh-memento-export-${stampOf()}.json`,
+      count: entries.length,
+      text: JSON.stringify(exportEnvelope(entries, memory.budgets()), null, 2),
+    }
+  }
+  if (typeof adapterId !== 'string') throw new RouteError(400, 'adapterId must be a string', 'INVALID_INPUT')
+
+  const registry = adapterRegistryOf(ctx)
+  if (registry === null) {
+    throw new RouteError(501, 'this composition mounted no memory adapter registry', 'ADAPTERS_UNAVAILABLE')
+  }
+  const payload = registry.export(adapterId, entries)
+  const format = exportFormatOf(registry, adapterId)
+  const isText = typeof payload === 'string'
+  const extension = isText ? (format.endsWith('-md') ? 'md' : 'txt') : 'json'
+  return {
+    ok: true,
+    adapterId,
+    format,
+    filename: `dsh-memento-${adapterId}-${stampOf()}.${extension}`,
+    count: entries.length,
+    // Upstream prints `JSON.stringify(payload, null, 2)` for object payloads and
+    // the bare string otherwise; mirror that so the two paths round-trip alike.
+    text: isText ? /** @type {string} */ (payload) : JSON.stringify(payload, null, 2),
+  }
+}
+
+/**
+ * Parse a memento export envelope into entries, mirroring `/memory import`.
+ *
+ * Only `track`/`scope`/`text` are required; `source`/`workspaceKey`/`agentKey`
+ * are carried when present and the seam validates the vocabulary afterwards.
+ * @param {string} payload - raw JSON text.
+ * @returns {Array<Record<string, unknown>>} validated entry inputs.
+ * @throws {RouteError} when the envelope or one entry is malformed.
+ */
+function envelopeEntries(payload) {
+  let parsed
+  try {
+    parsed = JSON.parse(payload)
+  } catch {
+    throw new RouteError(400, 'the payload is not valid JSON', 'BAD_JSON')
+  }
+  const shape = parsed !== null && typeof parsed === 'object'
+    ? /** @type {{plugin?: unknown, schema?: unknown, entries?: unknown}} */ (parsed)
+    : undefined
+  const valid = shape !== undefined && shape.plugin === EXPORT_PLUGIN && shape.schema === EXPORT_SCHEMA && Array.isArray(shape.entries)
+  if (!valid) {
+    throw new RouteError(400, `expected a ${EXPORT_PLUGIN} ${EXPORT_SCHEMA} export envelope`, 'IMPORT_BAD_SCHEMA')
+  }
+  const rows = /** @type {unknown[]} */ (shape.entries)
+  /** @type {Array<Record<string, unknown>>} */
+  const entries = []
+  for (const raw of rows) {
+    if (raw === null || typeof raw !== 'object') {
+      throw new RouteError(400, 'every entry needs string track, scope and non-empty text', 'IMPORT_BAD_ENTRY')
+    }
+    const entry = /** @type {{track?: unknown, scope?: unknown, text?: unknown}} */ (raw)
+    if (typeof entry.track !== 'string' || typeof entry.scope !== 'string' || typeof entry.text !== 'string' || entry.text.length === 0) {
+      throw new RouteError(400, 'every entry needs string track, scope and non-empty text', 'IMPORT_BAD_ENTRY')
+    }
+    entries.push(/** @type {Record<string, unknown>} */ (raw))
+  }
+  return entries
+}
+
+/**
+ * Seed a batch of entries from an uploaded document.
+ *
+ * The write rides `memory.seed`, which is one approval for the whole batch, a
+ * full budget pre-check, and a single transaction: an over-budget batch is
+ * rejected whole (no partial import) and the exact overage comes back through
+ * {@link errorResponse}.
+ * @param {Record<string, any>} memory - the ctx.memory service.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {Record<string, unknown>} body - parsed request body.
+ * @param {{agent: unknown, gate: Function}} write - write context.
+ * @returns {Promise<Record<string, unknown>>} `{ok, added}`.
+ * @throws {RouteError} on a malformed payload or a missing adapter registry.
+ */
+async function runImport(memory, ctx, body, write) {
+  const payload = body.payload
+  if (typeof payload !== 'string' || payload.trim().length === 0) {
+    throw new RouteError(400, 'payload is required', 'INVALID_INPUT')
+  }
+  const adapterId = body.adapterId
+  const overrideKeys = body.overrideKeys === true
+
+  /** @type {Array<Record<string, unknown>>} */
+  let entries
+  if (typeof adapterId === 'string' && adapterId.length > 0) {
+    const registry = adapterRegistryOf(ctx)
+    if (registry === null) {
+      throw new RouteError(501, 'this composition mounted no memory adapter registry', 'ADAPTERS_UNAVAILABLE')
+    }
+    const adapted = registry.adapt(adapterId, parseOrText(payload))
+    if (adapted === null || typeof adapted !== 'object' || !Array.isArray(adapted.entries)) {
+      throw new RouteError(400, `adapter ${JSON.stringify(adapterId)} produced no entry list`, 'ADAPTER_PAYLOAD')
+    }
+    entries = adapted.entries
+  } else {
+    entries = envelopeEntries(payload)
+  }
+
+  if (entries.length === 0) throw new RouteError(400, 'the payload contains no entries', 'INVALID_INPUT')
+  if (entries.length > MAX_IMPORT_ENTRIES) {
+    throw new RouteError(400, `a single import is limited to ${MAX_IMPORT_ENTRIES} entries`, 'INVALID_INPUT')
+  }
+
+  // Layer keys come from the file by default, so an entry imported back into its
+  // original workspace stays there. `overrideKeys` re-homes the whole batch to
+  // the session doing the import.
+  const normalized = entries.map((entry) => {
+    /** @type {Record<string, unknown>} */
+    const out = { track: entry.track, scope: entry.scope, text: entry.text }
+    if (typeof entry.source === 'string' && entry.source.length > 0) out.source = entry.source
+    if (!overrideKeys) {
+      if (typeof entry.workspaceKey === 'string' && entry.workspaceKey.length > 0) out.workspaceKey = entry.workspaceKey
+      if (typeof entry.agentKey === 'string' && entry.agentKey.length > 0) out.agentKey = entry.agentKey
+    }
+    if (Array.isArray(entry.tags)) out.tags = entry.tags
+    return out
+  })
+
+  const result = await memory.seed(normalized, write)
+  return { ok: true, added: result.added }
 }
 
 /**
@@ -659,6 +998,44 @@ function registerRoutes(ctx, memory) {
           }
           const result = await runDecide(ctx, memory, body, write)
           sendJson(res, 200, result)
+        } catch (error) {
+          const { status, payload } = errorResponse(error)
+          sendJson(res, status, payload)
+        }
+      },
+    }))
+
+    // Read-only, so it takes the header without a session anchor: the gate here
+    // is about mass egress, not about scoping a write.
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: ROUTE_EXPORT,
+      handler: (req, res) => {
+        try {
+          requireTabHeader(req)
+          const url = new URL(req.url ?? '', 'http://localhost')
+          const adapterId = url.searchParams.get('adapterId')
+          sendJson(res, 200, runExport(memory, ctx, adapterId === null || adapterId === '' ? {} : { adapterId }))
+        } catch (error) {
+          const { status, payload } = errorResponse(error)
+          sendJson(res, status, payload)
+        }
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: ROUTE_IMPORT,
+      handler: async (req, res) => {
+        try {
+          requireTabHeader(req)
+          const body = await readJsonBody(req)
+          const anchor = sessionAnchor(body)
+          const write = {
+            ...anchor,
+            gate: (/** @type {any} */ payload, /** @type {any} */ context) => routeGate(ctx, payload, context),
+          }
+          sendJson(res, 200, await runImport(memory, ctx, body, write))
         } catch (error) {
           const { status, payload } = errorResponse(error)
           sendJson(res, status, payload)
