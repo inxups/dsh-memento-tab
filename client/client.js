@@ -47,6 +47,13 @@
       /** GET-only variant of {@link TAB_HEADERS}. */
       const TAB_HEADERS_GET = { 'x-memento-tab': '1' }
 
+      /**
+       * Deadline for one route call. The host answers these in single-digit
+       * milliseconds, so 20s is far beyond any healthy round trip: hitting it
+       * means something is wedged, and failing loudly beats hanging forever.
+       */
+      const API_TIMEOUT_MS = 20000
+
       /** Mirrors the host route's body cap, so an oversized file never leaves the browser. */
       const MAX_PAYLOAD_BYTES = 512 * 1024
 
@@ -150,6 +157,7 @@
           MISSING_TAB_HEADER: '请求缺少来源标记，被路由拒绝。',
           BODY_TOO_LARGE: '内容超过了请求体上限。',
           INVALID_INPUT: '参数不合法。',
+          TIMEOUT: '请求超时 —— 服务端 20 秒内没有应答。操作可能没生效，请重试。',
         },
       }
       const en = {
@@ -246,6 +254,7 @@
           MISSING_TAB_HEADER: 'The request carried no origin marker, so the route refused it.',
           BODY_TOO_LARGE: 'The payload exceeded the request-body cap.',
           INVALID_INPUT: 'Invalid argument.',
+          TIMEOUT: 'No answer from the server within 20s. The write may not have landed — try again.',
         },
       }
 
@@ -379,21 +388,57 @@
 
       /**
        * One JSON round trip against this plugin's own routes.
+       *
+       * Every call carries a deadline. Without one, a request the browser never
+       * settles would hold its caller's guard flag (`state.saving` / `state.busy`)
+       * forever — and since those flags gate the next click, the tab would go
+       * permanently inert with only "处理中…" on screen and no way back except a
+       * page reload. The timeout is what makes that state recoverable.
        * @param {string} path - route pathname.
        * @param {RequestInit} [init] - fetch options.
-       * @param {AbortSignal} [signal] - caller lifetime.
+       * @param {AbortSignal} [signal] - caller lifetime (unmount).
+       * @param {number} [timeoutMs] - deadline before the request is abandoned.
        * @returns {Promise<any>} the parsed body.
        */
-      async function api(path, init, signal) {
-        const response = await fetch(path, { credentials: 'same-origin', ...init, signal })
-        const payload = await response.json().catch(() => ({}))
-        if (!response.ok || payload.ok === false) {
-          const error = new Error(payload.error ?? `HTTP ${response.status}`)
-          error.code = payload.code
-          error.status = response.status
-          throw error
+      async function api(path, init, signal, timeoutMs = API_TIMEOUT_MS) {
+        const deadline = new AbortController()
+        let timedOut = false
+        const timer = setTimeout(() => {
+          timedOut = true
+          deadline.abort()
+        }, timeoutMs)
+        const onOuterAbort = () => deadline.abort()
+        if (signal !== undefined) {
+          if (signal.aborted) deadline.abort()
+          else signal.addEventListener('abort', onOuterAbort, { once: true })
         }
-        return payload
+        try {
+          const response = await fetch(path, {
+            credentials: 'same-origin',
+            ...init,
+            signal: deadline.signal,
+          })
+          const payload = await response.json().catch(() => ({}))
+          if (!response.ok || payload.ok === false) {
+            const error = new Error(payload.error ?? `HTTP ${response.status}`)
+            error.code = payload.code
+            error.status = response.status
+            throw error
+          }
+          return payload
+        } catch (error) {
+          // A deadline we hit is a reportable failure; the caller unmounting is
+          // not, and the caller's own signal check discards it.
+          if (timedOut) {
+            const timeout = new Error(`timed out after ${timeoutMs}ms`)
+            timeout.code = 'TIMEOUT'
+            throw timeout
+          }
+          throw error
+        } finally {
+          clearTimeout(timer)
+          if (signal !== undefined) signal.removeEventListener('abort', onOuterAbort)
+        }
       }
 
       /**
@@ -573,10 +618,14 @@
             return true
           } catch (error) {
             if (abort.signal.aborted) return false
-            state.saving = false
-            saveBtn.disabled = false
             say(describeError(t, error), true)
             return false
+          } finally {
+            // The unlock belongs here, not in the branches above: a failure that
+            // escaped both would otherwise leave `saving` true and swallow every
+            // later click at the guard on the first line.
+            state.saving = false
+            saveBtn.disabled = false
           }
         }
 
@@ -641,15 +690,15 @@
               : ''
             const payload = await api(`${ROUTE_EXPORT}${query}`, { headers: TAB_HEADERS_GET }, abort.signal)
             if (abort.signal.aborted) return
-            state.busy = false
             state.exportText = typeof payload.text === 'string' ? payload.text : ''
             state.exportName = typeof payload.filename === 'string' ? payload.filename : 'dsh-memento-export.txt'
             render()
             say(`${t('exportRun')} · ${payload.count ?? 0} ${t('entriesUnit')}`, false)
           } catch (error) {
             if (abort.signal.aborted) return
-            state.busy = false
             say(describeError(t, error), true)
+          } finally {
+            state.busy = false
           }
         }
 
@@ -747,8 +796,6 @@
               }),
             }, abort.signal)
             if (abort.signal.aborted) return
-            state.busy = false
-            saveBtn.disabled = false
             state.importText = ''
             state.importName = ''
             await refresh()
@@ -756,9 +803,12 @@
             say(`${t('imported')} ${payload.added ?? 0} ${t('entriesUnit')}`, false)
           } catch (error) {
             if (abort.signal.aborted) return
+            say(describeError(t, error), true)
+          } finally {
+            // Same reason as `write`: both flags gate later clicks, so they are
+            // released on every path, not just the happy one.
             state.busy = false
             saveBtn.disabled = false
-            say(describeError(t, error), true)
           }
         }
 

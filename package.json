@@ -1,7 +1,7 @@
 {
   "name": "dsh-memento-tab",
-  "version": "0.3.1",
-  "description": "Session-scoped memory tab for DeepSeek Harness, rendered beside Chat / Trajectory / Context, covering the whole /memory surface (list, query, add, rewrite, remove, merge, proposals, budgets, audit, adapters, export, import). A companion to dsh-memento: it consumes the public ctx.memory seam and registers its own routes, so it never forks upstream. Reading the tab never increments the store's recall counters.",
+  "version": "0.3.2",
+  "description": "Session-scoped memory tab for DeepSeek Harness, rendered beside Chat / Trajectory / Context, covering the whole /memory surface (list, query, add, rewrite, remove, merge, proposals, budgets, audit, adapters, export, import). A companion to dsh-memento: it consumes the public ctx.memory seam and registers its own routes, so it never forks upstream. Reading the tab never increments the store's recall counters. Every route call carries a deadline, so a wedged request reports a failure instead of locking the tab.",
   "license": "MIT",
   "author": "inxups",
   "repository": {
