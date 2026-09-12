@@ -625,6 +625,60 @@ function handleState(ctx, memory, req, res) {
 }
 
 /**
+ * Whether this dsh-memento build can delete one entry by its primary key.
+ *
+ * The seam's public `remove` addresses entries by a unique text substring,
+ * which two identical texts make permanently unresolvable. The store object
+ * exposes its raw handle (`db`) and ledger, so the tab can offer a by-id path
+ * that reproduces the seam's own sequence — locate, gate, delete, audit —
+ * without the substring. Every accessor is probed: a future upstream that
+ * hides the handle degrades the route to the match path instead of failing.
+ * @param {Record<string, any>} memory - the ctx.memory service.
+ * @returns {boolean} true when db, listEntries and auditAppend are all usable.
+ */
+export function supportsIdDelete(memory) {
+  const store = /** @type {{store?: any}} */ (memory)?.store
+  return store !== null && typeof store === 'object'
+    && typeof store.listEntries === 'function'
+    && typeof store.auditAppend === 'function'
+    && store.db !== null && typeof store.db === 'object'
+    && typeof store.db.prepare === 'function'
+}
+
+/**
+ * Delete one entry by primary key, mirroring the seam's remove semantics.
+ *
+ * Order matches upstream: locate first (an unknown id fails before the gate
+ * is disturbed), then ask the gate with the entry's real text
+ * (approve-what-you-see), then delete and audit. A denied verdict lands a
+ * `remove-denied` audit row — the turn-external gate path has no approval
+ * audit pair, so that row is the only evidence of the refusal.
+ *
+ * Layer visibility is deliberately NOT re-applied: the tab lists every layer
+ * and the person clicking is the owner. The gate still governs the delete.
+ * @param {Record<string, any>} memory - the ctx.memory service.
+ * @param {string} id - entry primary key.
+ * @param {{agent: any, gate: Function}} write - write context.
+ * @returns {Promise<{entry: Record<string, unknown>}>} the removed entry.
+ */
+export async function removeById(memory, id, write) {
+  const store = /** @type {any} */ (memory).store
+  const entry = /** @type {Array<Record<string, any>>} */ (store.listEntries()).find((row) => row.id === id)
+  if (entry === undefined) {
+    throw new RouteError(404, `no entry with id ${JSON.stringify(id)}`, 'ENTRY_NOT_FOUND')
+  }
+  const sessionId = write?.agent?.session?.id ?? null
+  const outcome = await write.gate({ action: 'remove', track: entry.track, scope: entry.scope, text: entry.text, source: entry.source }, write)
+  if (outcome !== 'allowed-once') {
+    store.auditAppend({ action: 'remove-denied', track: entry.track, scope: entry.scope, entryId: entry.id, text: entry.text, outcome: `${outcome} (via write gate)`, source: entry.source, sessionId })
+    throw new RouteError(403, `remove denied by the write gate: ${outcome}`, 'WRITE_DENIED')
+  }
+  store.db.prepare('DELETE FROM entries WHERE id = ?').run(id)
+  store.auditAppend({ action: 'remove', track: entry.track, scope: entry.scope, entryId: entry.id, text: entry.text, outcome: `${outcome} (via write gate)`, source: entry.source, sessionId })
+  return { entry }
+}
+
+/**
  * Run one write through the seam.
  * @param {Record<string, any>} memory - the ctx.memory service.
  * @param {Record<string, unknown>} body - parsed request body.
@@ -656,6 +710,11 @@ async function runWrite(memory, body, write) {
       return memory.replace({ track, scope, match: body.match, text: body.text, ...tagged }, write)
     }
     case 'remove': {
+      // By-id wins: identical texts make the substring permanently ambiguous.
+      // `match` remains as the fallback for a store that hides its handle.
+      if (typeof body.id === 'string' && body.id.length > 0 && supportsIdDelete(memory)) {
+        return removeById(memory, body.id, write)
+      }
       if (typeof body.match !== 'string' || body.match.length === 0) {
         throw new RouteError(400, 'match is required', 'INVALID_INPUT')
       }

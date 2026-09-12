@@ -81,6 +81,7 @@
         cancel: '取消',
         confirmRemove: '删除这条记忆？此操作立即生效。',
         approving: '处理中…',
+        anchorPending: '会话信息还没加载好（拿不到 cwd），等一两秒再点。',
         approve: '批准',
         dismiss: '驳回',
         proposals: '待批提案',
@@ -178,6 +179,7 @@
         cancel: 'Cancel',
         confirmRemove: 'Delete this entry? This takes effect immediately.',
         approving: 'Working…',
+        anchorPending: 'Session details are still loading (no cwd yet) — try again in a moment.',
         approve: 'Approve',
         dismiss: 'Dismiss',
         proposals: 'Pending proposals',
@@ -600,11 +602,19 @@
         /** Run one write and reload on success. Returns whether it landed. */
         async function write(payload, okMessage) {
           if (state.saving) return false
+          const header = anchor()
+          // A workspace PLACEMENT without the session's cwd lands in the ''
+          // layer: visible to every workspace, and a second identical text
+          // there makes the pair unaddressable by substring. Wait for the
+          // anchor instead. By-id removes are exempt: the row carries its keys.
+          if (payload.op !== 'remove' && payload.scope === 'workspace' && header.cwd === undefined) {
+            say(t('anchorPending'), true)
+            return false
+          }
           state.saving = true
           saveBtn.disabled = true
           say(t('approving'), false)
           try {
-            const header = anchor()
             await api(ROUTE_WRITE, {
               method: 'POST',
               headers: TAB_HEADERS,
@@ -1049,9 +1059,10 @@
             const entry = entries.find((candidate) => candidate.id === removeId)
             if (entry === undefined) return
             if (!window.confirm(t('confirmRemove'))) return
-            // The seam addresses entries by a unique substring; the full text is
-            // the only value guaranteed unique without a second round trip.
-            void write({ op: 'remove', track: entry.track, scope: entry.scope, match: entry.text }, t('removed'))
+            // Address the entry by primary key: two entries can share one
+            // text, which the substring protocol can never resolve. `match`
+            // stays in the body as the fallback for hosts older than 0.3.3.
+            void write({ op: 'remove', id: entry.id, track: entry.track, scope: entry.scope, match: entry.text }, t('removed'))
             return
           }
           const editId = button.getAttribute('data-edit')

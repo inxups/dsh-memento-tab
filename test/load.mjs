@@ -392,6 +392,88 @@ await check('write route refuses a request without the tab header', async () => 
   assert.equal(res.json().code, 'MISSING_TAB_HEADER')
 })
 
+console.log('data routes: remove by id')
+
+/**
+ * A memory stub whose store can really delete by primary key.
+ * @param {Array<Record<string, unknown>>} entries - rows listEntries returns.
+ * @returns {any} ctx.memory stand-in with deleted/audit recording.
+ */
+function idCapableMemory(entries) {
+  const memory = fakeMemory({ entries })
+  memory.deleted = /** @type {string[]} */ ([])
+  memory.audit = /** @type {Array<Record<string, unknown>>} */ ([])
+  memory.store.db = { prepare: () => ({ run: (id) => { memory.deleted.push(id) } }) }
+  memory.store.auditAppend = (row) => { memory.audit.push(row); return row }
+  return memory
+}
+
+const DUPES = [
+  { id: 'e1', track: 'user', scope: 'workspace', text: 'same text', workspaceKey: '/w', agentKey: 'standard', source: 'command', tags: [] },
+  { id: 'e2', track: 'user', scope: 'workspace', text: 'same text', workspaceKey: '', agentKey: '', source: 'dsh-memento', tags: [] },
+]
+
+await check('supportsIdDelete probes the store surface', () => {
+  assert.equal(PLUGIN.supportsIdDelete(fakeMemory()), false, 'the default stub hides the raw handle')
+  assert.equal(PLUGIN.supportsIdDelete(idCapableMemory(DUPES)), true)
+})
+
+await check('remove by id deletes the addressed row even when its text is not unique', async () => {
+  const memory = idCapableMemory(DUPES)
+  const { routes } = await boot({ memory })
+  const res = await hit(routes, '/api/memento-tab/write', fakeRequest(
+    '/api/memento-tab/write',
+    { op: 'remove', id: 'e1', track: 'user', scope: 'workspace', match: 'same text', sessionId: 's1' },
+    TAB_HEADERS,
+  ))
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.json().ok, true)
+  assert.deepEqual(memory.deleted, ['e1'], 'the substring would have been ambiguous; the id is not')
+  const last = memory.audit.at(-1)
+  assert.equal(last.action, 'remove')
+  assert.equal(last.entryId, 'e1')
+  assert.equal(last.text, 'same text', 'the audit carries the entry text, approve-what-you-see style')
+  assert.match(last.outcome, /allowed-once \(via write gate\)/)
+})
+
+await check('remove by id records a denial and keeps the row when the gate says no', async () => {
+  const memory = idCapableMemory(DUPES)
+  await assert.rejects(
+    PLUGIN.removeById(memory, 'e1', { agent: { session: { id: 's1', header: {} } }, gate: async () => 'rejected' }),
+    (error) => error?.code === 'WRITE_DENIED' && error?.status === 403,
+  )
+  assert.deepEqual(memory.deleted, [], 'a denied delete must not touch the store')
+  assert.equal(memory.audit.at(-1).action, 'remove-denied', 'the refusal is the only evidence chain on this path')
+})
+
+await check('remove by id fails before the gate when the id is unknown', async () => {
+  const memory = idCapableMemory(DUPES)
+  let gateCalls = 0
+  await assert.rejects(
+    PLUGIN.removeById(memory, 'nope', {
+      agent: { session: { id: 's1', header: {} } },
+      gate: async () => { gateCalls += 1; return 'allowed-once' },
+    }),
+    (error) => error?.code === 'ENTRY_NOT_FOUND' && error?.status === 404,
+  )
+  assert.equal(gateCalls, 0, 'an unlocatable row must not disturb the gate')
+  assert.equal(memory.audit.length, 0)
+})
+
+await check('remove without a capable store falls back to the substring path', async () => {
+  const memory = fakeMemory()
+  let matchSeen = null
+  memory.remove = async (input) => { matchSeen = input.match; return { entry: null } }
+  const { routes } = await boot({ memory })
+  const res = await hit(routes, '/api/memento-tab/write', fakeRequest(
+    '/api/memento-tab/write',
+    { op: 'remove', id: 'e1', track: 'user', scope: 'workspace', match: 'hi', sessionId: 's1' },
+    TAB_HEADERS,
+  ))
+  assert.equal(res.statusCode, 200)
+  assert.equal(matchSeen, 'hi', 'a store that hides its handle degrades to the seam instead of failing')
+})
+
 await check('decide route refuses a request without the tab header', async () => {
   const ctx = new Context()
   ctx.provide('memory', fakeMemory())
