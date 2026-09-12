@@ -28,7 +28,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test/smoke.mjs"
+    "test": "node test/smoke.mjs && node test/load.mjs",
+    "test:smoke": "node test/smoke.mjs",
+    "test:load": "node test/load.mjs"
   },
   "engines": {
     "node": ">=22.5"

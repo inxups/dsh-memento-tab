@@ -41,8 +41,17 @@ export const name = 'dsh-memento-tab'
 /**
  * Hard dependency on the memory seam. Without it this plugin has nothing to
  * show, so it simply never activates rather than half-working.
+ *
+ * `approval` is a hard dependency too: the seam's write methods are useless
+ * without a gate to ask, and Cordis THROWS on `ctx.<name>` when `<name>` was
+ * not injected.
+ *
+ * `webServer` is deliberately absent. This plugin is useful in any composition
+ * that has memory, and one without a web server should still activate with no
+ * data routes. {@link withService} waits for it instead — the only way to reach
+ * a service without declaring it.
  */
-export const inject = ['memory']
+export const inject = ['memory', 'approval']
 
 /** Approval-reason marker claimed by dsh-memento's answerer. */
 const REQUEST_MARKER = '[dsh-memento]'
@@ -463,6 +472,47 @@ async function runDecide(ctx, memory, body, write) {
 }
 
 /**
+ * Read one optional service without declaring a hard dependency on it.
+ *
+ * Cordis THROWS on `ctx.<name>` when `<name>` was not injected — so a bare
+ * `if (ctx.x === undefined)` guard never runs, because the property access is
+ * itself the failure. Optional services must go through `ctx.get`.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {string} serviceName - service key.
+ * @returns {any} the service, or undefined when this composition has none.
+ */
+function serviceOf(ctx, serviceName) {
+  const service = ctx.get(serviceName)
+  return service === undefined || service === null ? undefined : service
+}
+
+/**
+ * Run `fn` with one optional service, now or as soon as it appears.
+ *
+ * The idiom upstream uses for its own optional services: look now, otherwise
+ * wait on the loader's `internal/service` announcement. The listener rides the
+ * plugin fiber, so an unload while waiting cannot leak it.
+ * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
+ * @param {string} serviceName - service key to await.
+ * @param {(service: any) => void} fn - consumer, called at most once.
+ */
+function withService(ctx, serviceName, fn) {
+  const existing = serviceOf(ctx, serviceName)
+  if (existing !== undefined) {
+    fn(existing)
+    return
+  }
+  const off = ctx.on('internal/service', (/** @type {string} */ announced) => {
+    if (announced !== serviceName) return
+    const service = serviceOf(ctx, serviceName)
+    if (service === undefined) return
+    off()
+    fn(service)
+  })
+  ctx.effect(() => off, `dsh-memento-tab: waiting for ${serviceName}`)
+}
+
+/**
  * Mount the tab's routes on the composition's web server.
  *
  * Routes are torn down with the plugin fiber: `webServer.register` returns the
@@ -472,77 +522,88 @@ async function runDecide(ctx, memory, body, write) {
  * @param {Record<string, any>} memory - the ctx.memory service.
  */
 function registerRoutes(ctx, memory) {
-  const webServer = ctx.webServer
-  if (webServer === undefined || webServer === null || typeof webServer.register !== 'function') {
-    ctx.logger?.warn?.('dsh-memento-tab: no webServer in this composition; the tab has no data routes')
-    return
-  }
+  withService(ctx, 'webServer', (webServer) => {
+    if (typeof webServer.register !== 'function') {
+      serviceOf(ctx, 'logger')?.warn?.('dsh-memento-tab: webServer exposes no register(); the tab has no data routes')
+      return
+    }
 
-  /** @type {Array<(() => void) | undefined>} */
-  const disposers = []
-  ctx.effect(() => () => {
-    for (const dispose of disposers.splice(0).reverse()) dispose?.()
-  }, 'dsh-memento-tab: routes')
+    /** @type {Array<(() => void) | undefined>} */
+    const disposers = []
+    ctx.effect(() => () => {
+      for (const dispose of disposers.splice(0).reverse()) dispose?.()
+    }, 'dsh-memento-tab: routes')
 
-  disposers.push(webServer.register({
-    kind: 'exact',
-    path: ROUTE_STATE,
-    handler: (req, res) => {
-      try {
-        handleState(ctx, memory, req, res)
-      } catch (error) {
-        const { status, payload } = errorResponse(error)
-        sendJson(res, status, payload)
-      }
-    },
-  }))
-
-  disposers.push(webServer.register({
-    kind: 'exact',
-    path: ROUTE_WRITE,
-    handler: async (req, res) => {
-      try {
-        const body = await readJsonBody(req)
-        const anchor = sessionAnchor(body)
-        const write = {
-          ...anchor,
-          gate: (/** @type {any} */ payload, /** @type {any} */ context) => routeGate(ctx, payload, context),
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: ROUTE_STATE,
+      handler: (req, res) => {
+        try {
+          handleState(ctx, memory, req, res)
+        } catch (error) {
+          const { status, payload } = errorResponse(error)
+          sendJson(res, status, payload)
         }
-        const result = await runWrite(memory, body, write)
-        sendJson(res, 200, { ok: true, result })
-      } catch (error) {
-        const { status, payload } = errorResponse(error)
-        sendJson(res, status, payload)
-      }
-    },
-  }))
+      },
+    }))
 
-  disposers.push(webServer.register({
-    kind: 'exact',
-    path: ROUTE_DECIDE,
-    handler: async (req, res) => {
-      try {
-        const body = await readJsonBody(req)
-        const anchor = sessionAnchor(body)
-        const write = {
-          ...anchor,
-          gate: (/** @type {any} */ payload, /** @type {any} */ context) => routeGate(ctx, payload, context),
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: ROUTE_WRITE,
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const anchor = sessionAnchor(body)
+          const write = {
+            ...anchor,
+            gate: (/** @type {any} */ payload, /** @type {any} */ context) => routeGate(ctx, payload, context),
+          }
+          const result = await runWrite(memory, body, write)
+          sendJson(res, 200, { ok: true, result })
+        } catch (error) {
+          const { status, payload } = errorResponse(error)
+          sendJson(res, status, payload)
         }
-        const result = await runDecide(ctx, memory, body, write)
-        sendJson(res, 200, result)
-      } catch (error) {
-        const { status, payload } = errorResponse(error)
-        sendJson(res, status, payload)
-      }
-    },
-  }))
+      },
+    }))
+
+    disposers.push(webServer.register({
+      kind: 'exact',
+      path: ROUTE_DECIDE,
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const anchor = sessionAnchor(body)
+          const write = {
+            ...anchor,
+            gate: (/** @type {any} */ payload, /** @type {any} */ context) => routeGate(ctx, payload, context),
+          }
+          const result = await runDecide(ctx, memory, body, write)
+          sendJson(res, 200, result)
+        } catch (error) {
+          const { status, payload } = errorResponse(error)
+          sendJson(res, status, payload)
+        }
+      },
+    }))
+  })
 }
 
 /**
  * Register the tab's host half.
+ *
+ * The whole body is guarded on purpose. A throw from a plugin's `apply` fails
+ * the entire loader tree, which means a bug in THIS plugin would stop dsh from
+ * booting at all — the harness must never be hostage to a UI tab. Failures are
+ * logged loudly and the plugin degrades to "no data routes" instead.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context carrying `ctx.memory`.
  */
 export function apply(ctx) {
-  const memory = /** @type {Record<string, any>} */ (ctx.memory)
-  registerRoutes(ctx, memory)
+  try {
+    const memory = /** @type {Record<string, any>} */ (ctx.memory)
+    registerRoutes(ctx, memory)
+  } catch (error) {
+    const message = error instanceof Error ? error.stack ?? error.message : String(error)
+    serviceOf(ctx, 'logger')?.error?.(`dsh-memento-tab: failed to mount; the memory tab will have no data routes\n${message}`)
+  }
 }

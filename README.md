@@ -56,9 +56,14 @@ dsh plugin --profile web add link:/path/to/dsh-memento-tab
 
 ## 依赖与边界
 
-- **硬依赖** `ctx.memory`：`inject: ['memory']`。上游不在时本插件不激活，不会半死不活。
+- **硬依赖** `ctx.memory` 与 `approval`：`inject: ['memory', 'approval']`。上游不在时本插件
+  不激活，不会半死不活。
 - **路由**：本插件自己注册 `/api/memento-tab/{state,write,decide}`，是精确路径路由，
-  和上游的 `/api/memento/*` 不冲突。`webServer` 缺失的组合里会退化为「无数据路由」并打日志。
+  和上游的 `/api/memento/*` 不冲突。
+- **`webServer` 故意不写进 `inject`**：没有 web server 的组合里本插件仍然激活，只是没有数据
+  路由；服务出现得晚也会被接上。注意 Cordis 对**未声明的服务做属性访问会直接抛错** ——
+  `if (ctx.webServer === undefined)` 这种写法根本执行不到，属性访问本身就是那次抛出。
+  可选服务一律走 `ctx.get()`。
 - **只读降级**：`auditList` / `proposalList` / `proposalDecide` 在上游是 provider 账本而非
   类型化接缝，所以这里全部**特性探测**调用 —— 上游改名只会让审计尾和提案区显示
   「此版本未暴露账本」，不会让整个 tab 挂掉。
@@ -67,6 +72,22 @@ dsh plugin --profile web add link:/path/to/dsh-memento-tab
   断言。除此之外没有复制任何上游内部知识。
 - **不认证**：DSH 的 webserver 对自定义 `/api/*` 路由不做鉴权（上游面板路由同理）。
   服务只监听回环地址；若把 `writePolicy` 设成 `auto`，同机进程即可写入，这是配置取舍。
+
+## 启动安全（这是踩过坑的地方）
+
+插件的 `apply()` 一旦抛错，失败的是**整个 loader 树** —— dsh 完全起不来，不是这个 tab 消失。
+所以这里有两条硬约束：
+
+1. **`apply()` 整体包了 try/catch**：任何异常只打日志并退化成「无数据路由」，绝不阻断启动。
+2. **`test/load.mjs` 在真实 Cordis 上下文里加载本插件**，覆盖三种情形：有 web server（注册
+   三条路由）、没有 web server（必须仍能激活）、web server 后到（从 `internal/service`
+   接上）。第一条写错的版本就是死在第二种情形上。
+
+```sh
+npm test          # 两个测试都跑
+npm run test:load # 只跑加载契约测试（默认在 /Users/inxups/project/deepseek-harness 找 cordis，
+                  # 用 DSH_SOURCE 覆盖；找不到就 skip 而非失败）
+```
 
 ## 许可
 
