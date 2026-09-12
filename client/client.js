@@ -444,19 +444,36 @@
       }
 
       /**
-       * Read the live Session header this tab is rendered for.
+       * Read the live session's write anchor: the cwd and agent preset the
+       * host scopes a write by.
        *
-       * This is the same source dsh-memento's own tool path reads, so a write
-       * started here lands in the layer the session actually sees.
+       * The client session face has no `header` — that shape exists only on
+       * the host — so the anchor comes from the sessions list snapshot the
+       * sidebar and conversation title already render from: the row carries
+       * `cwd` and the host-computed projection
+       * `projectionValues.agentPreset`. The binding's projection face is the
+       * fallback for a row whose values have not arrived yet.
+       *
+       * Read through `ctx.get`, never `ctx.sessions`: an undeclared service
+       * property access throws in Cordis, and a throwing accessor here would
+       * silently degrade every write to an empty anchor.
        * @param {any} ctx - client context.
        * @param {string} sessionId - session view identity.
-       * @returns {{cwd?: string, agentPreset?: string}} header slice.
+       * @returns {{cwd?: string, agentPreset?: string}} anchor slice.
        */
       function sessionHeader(ctx, sessionId) {
         try {
-          const header = ctx.sessions?.binding?.(sessionId)?.session?.header
-          const cwd = typeof header?.cwd === 'string' ? header.cwd : undefined
-          const agentPreset = typeof header?.agentPreset === 'string' ? header.agentPreset : undefined
+          const sessions = ctx.get?.('sessions')
+          const row = sessions?.list?.getSnapshot?.()?.byId?.[sessionId]
+          const cwd = typeof row?.cwd === 'string' && row.cwd.length > 0 ? row.cwd : undefined
+          let agentPreset = typeof row?.projectionValues?.agentPreset === 'string' && row.projectionValues.agentPreset.length > 0
+            ? row.projectionValues.agentPreset
+            : undefined
+          if (agentPreset === undefined) {
+            const face = sessions?.binding?.(sessionId)?.session?.projections?.faceOf?.('agentPreset')
+            const value = face?.getSnapshot?.()
+            if (typeof value === 'string' && value.length > 0) agentPreset = value
+          }
           return { cwd, agentPreset }
         } catch {
           return {}
