@@ -2,6 +2,9 @@
 
 > 给 DeepSeek Harness 的 **会话级记忆 tab** —— 挂在「对话 / 轨迹 / 上下文」旁边。
 
+小记：去pi了，跑路了，ai写的也太拉了，全堆在一起，发现已经晚了😭
+
+
 [`dsh-memento`](https://www.npmjs.com/package/dsh-memento) 的**伴随插件**，不是它的 fork。
 它只消费上游公开的 `ctx.memory` 接缝，自己注册路由、自己注册 tab，所以上游发版永远不会
 产生合并冲突 —— 上游只能通过改动**已发布的接缝**来影响它，不能通过重构内部实现。
